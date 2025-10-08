@@ -20,7 +20,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
             _LOGGER.debug("Kein Update erforderlich oder kein update_needed vorhanden für %s", station_id)
             #continue
 
-        entities.append(PlantbotFirmwareUpdate(coordinator, station_id, station["name"],station_ip))
+    entities.append(PlantbotFirmwareUpdate(coordinator, station_id, station.get("name", f"Station {station_id}"), station_ip))
     
     async_add_entities(entities)
 
