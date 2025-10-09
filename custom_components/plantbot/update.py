@@ -13,14 +13,15 @@ async def async_setup_entry(hass, entry, async_add_entities):
     entities = []
 
     for station_id, station in coordinator.data.items():
-        _LOGGER.debug("Update-Check für %s - %s", station_id, station.get("update_needed"))
+        # Prüfe Update-Status aus Firmware-Struktur oder direkt
+        firmware = station.get("Firmware", {})
+        update_needed = firmware.get("update_needed") or station.get("update_needed")
+        
+        _LOGGER.debug("Update-Check für %s - update_needed: %s", station_id, update_needed)
         station_ip = station.get("ip")
-        update_needed = station.get("update_needed")
-        if not (update_needed is True or str(update_needed).lower() == "true"):
-            _LOGGER.debug("Kein Update erforderlich oder kein update_needed vorhanden für %s", station_id)
-            #continue
-
-    entities.append(PlantbotFirmwareUpdate(coordinator, station_id, station.get("name", f"Station {station_id}"), station_ip))
+        
+        # Erstelle immer eine Update-Entity (auch wenn kein Update benötigt wird)
+        entities.append(PlantbotFirmwareUpdate(coordinator, station_id, station.get("name", f"Station {station_id}"), station_ip))
     
     async_add_entities(entities)
 
@@ -55,17 +56,39 @@ class PlantbotFirmwareUpdate(UpdateEntity):
 
     @property
     def installed_version(self):
-        value = self.coordinator.data[self.station_id].get("current_version")
+        station_data = self.coordinator.data[self.station_id]
+        # Versuche zuerst Firmware-Unterstruktur, dann direkt
+        firmware = station_data.get("Firmware", {})
+        value = firmware.get("current_version") or station_data.get("current_version")
         return None if value in (None, "", "null") else value
 
     @property
     def latest_version(self):
-        value = self.coordinator.data[self.station_id].get("latestVersion")
+        station_data = self.coordinator.data[self.station_id]
+        # Versuche zuerst Firmware-Unterstruktur, dann direkt
+        firmware = station_data.get("Firmware", {})
+        value = firmware.get("latest_version") or station_data.get("latestVersion")
         return None if value in (None, "", "null") else value
 
     @property
     def available(self):
         return self.coordinator.last_update_success
+
+    def _get_update_needed(self):
+        """Prüft, ob ein Update benötigt wird."""
+        station_data = self.coordinator.data[self.station_id]
+        # Versuche zuerst Firmware-Unterstruktur, dann direkt
+        firmware = station_data.get("Firmware", {})
+        update_needed = firmware.get("update_needed") or station_data.get("update_needed")
+        
+        # Fallback: Versionsnummern vergleichen
+        if update_needed is None:
+            installed = self.installed_version
+            latest = self.latest_version
+            if installed and latest:
+                return installed != latest
+        
+        return bool(update_needed)
     @property
     def progress(self) -> int | None:
         return self._update_data.get("progress")

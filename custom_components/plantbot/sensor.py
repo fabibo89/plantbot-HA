@@ -48,7 +48,7 @@ SENSOR_TYPES = {
     "lastVolume": {"name": "Volume", "unit": 'ml',"device_class":None ,"state_class": SensorStateClass.MEASUREMENT, "optional": True,"icon": "mdi:water"},
     "status": {"name": "Status", "unit": None,"device_class":None, "optional": False,"icon": "mdi:information"},
     "wifi": {"name": "WIFI", "unit": SIGNAL_STRENGTH_DECIBELS_MILLIWATT,"device_class":SensorDeviceClass.SIGNAL_STRENGTH,"state_class": SensorStateClass.MEASUREMENT, "optional": False, 'valid_range': (-100.0, -20.0)},
-    "runtime": {"name": "Runtime", "unit": "min" ,"device_class":SensorDeviceClass.DURATION,"state_class": SensorStateClass.MEASUREMENT, "optional": True},
+    "runtime": {"name": "Runtime", "unit": "min" ,"device_class":SensorDeviceClass.DURATION,"state_class": SensorStateClass.MEASUREMENT, "optional": True, "convert_from_seconds": True},
     "water_runtime": {"name": "Wasser Runtime", "unit": "s" ,"device_class":SensorDeviceClass.DURATION,"state_class": SensorStateClass.MEASUREMENT, "optional": True,"icon": "mdi:timer-sand"},
     "last_reset_reason": {"name": "Letzter Reset Grund", "unit": None, "device_class": None, "optional": True,"icon": "mdi:restart"},
     "memory_usage": {"name": "Speicherauslastung", "unit": None,"device_class": None,"state_class": SensorStateClass.MEASUREMENT, "optional": True,"icon": "mdi:memory"}
@@ -233,6 +233,15 @@ class PlantbotSensor(SensorEntity):
         # Validierung (0 ist erlaubt, sofern ignore_zero=False)
         if not _plantbot_value_is_valid(self._props, value):
             return None
+
+        # Spezielle Umrechnung für bestimmte Sensoren
+        if self._props.get("convert_from_seconds", False) and value is not None:
+            try:
+                # Konvertiere Sekunden zu Minuten
+                num = float(value) / 60.0
+                return round(num, 1)
+            except (TypeError, ValueError):
+                pass
 
         # Zahl zurückgeben, ansonsten den Rohwert
         if isinstance(value, int):
