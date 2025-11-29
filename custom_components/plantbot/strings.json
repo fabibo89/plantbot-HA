@@ -2,15 +2,71 @@
   "domain": "plantbot",
   "name": "PlantBot Bewässerung",
   "config_flow": {
-    "title": "PlantBot Server",
+    "title": "PlantBot Bewässerung",
     "step": {
       "user": {
-        "title": "Verbindung einrichten",
-        "description": "Gib die Serveradresse deines PlantBot-Systems ein.",
+        "title": "Verbindungstyp wählen",
+        "description": "Wähle, ob du eine Server-URL oder eine direkte PlantBot IP-Adresse eingeben möchtest.",
         "data": {
-          "server": "Server-URL"
+          "connection_type": "Verbindungstyp"
+        }
+      },
+      "server": {
+        "title": "Server-URL eingeben",
+        "description": "Gib die URL deines PlantBot-Servers ein (z.B. http://192.168.1.100:8000).",
+        "data": {
+          "server_url": "Server-URL"
+        },
+        "errors": {
+          "server_url_required": "Server-URL ist erforderlich",
+          "invalid_url": "Ungültige URL"
+        }
+      },
+      "server_auth": {
+        "title": "Authentifizierung",
+        "description": "Gib deine Anmeldedaten für den PlantBot-Server ein.",
+        "data": {
+          "email": "E-Mail-Adresse",
+          "password": "Passwort"
+        },
+        "errors": {
+          "email_required": "E-Mail-Adresse ist erforderlich",
+          "invalid_email": "Ungültige E-Mail-Adresse",
+          "password_required": "Passwort ist erforderlich",
+          "invalid_auth": "Ungültige Anmeldedaten",
+          "account_inactive": "Account ist inaktiv",
+          "connection_error": "Verbindungsfehler - Prüfe Server-URL und Netzwerk",
+          "timeout_error": "Zeitüberschreitung - Server antwortet nicht",
+          "endpoint_not_found": "Login-Endpoint nicht gefunden - Prüfe Server-URL",
+          "invalid_response": "Ungültige Server-Antwort"
+        }
+      },
+      "device": {
+        "title": "PlantBot IP-Adresse eingeben",
+        "description": "Gib die IP-Adresse deines PlantBot-Geräts ein (z.B. 192.168.1.100).",
+        "data": {
+          "device_ip": "PlantBot IP-Adresse"
+        },
+        "errors": {
+          "device_ip_required": "IP-Adresse ist erforderlich",
+          "invalid_ip": "Ungültige IP-Adresse"
+        }
+      },
+      "mqtt_config": {
+        "title": "MQTT-Broker konfigurieren",
+        "description": "Gib die Einstellungen für den MQTT-Broker ein (für Ventilsteuerung).",
+        "data": {
+          "mqtt_broker": "MQTT-Broker (IP oder Hostname)",
+          "mqtt_port": "MQTT-Port",
+          "mqtt_username": "MQTT-Benutzername (optional)",
+          "mqtt_password": "MQTT-Passwort (optional)"
+        },
+        "errors": {
+          "mqtt_broker_required": "MQTT-Broker ist erforderlich",
+          "invalid_mqtt_broker": "Ungültiger MQTT-Broker"
         }
       }
     }
   }
 }
+
