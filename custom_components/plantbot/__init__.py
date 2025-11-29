@@ -63,14 +63,35 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
             # Der Coordinator wird bei den nächsten Updates versuchen, die Daten zu holen
         
         # Lade Platforms - auch wenn Refresh fehlgeschlagen ist
-        try:
-            await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-        except asyncio.CancelledError:
-            _LOGGER.error("Platform-Setup wurde abgebrochen")
-            raise
-        except Exception as platform_error:
-            _LOGGER.error("Fehler beim Laden der Platforms: %s", platform_error, exc_info=True)
-            raise
+        # Versuche jede Platform einzeln zu laden, um zu sehen welche fehlschlägt
+        platforms_to_load = []
+        for platform in PLATFORMS:
+            # Prüfe ob button-Platform verfügbar ist
+            if platform == "button":
+                try:
+                    # Versuche button-Modul zu importieren
+                    import importlib
+                    importlib.import_module(f"custom_components.{DOMAIN}.button")
+                    platforms_to_load.append(platform)
+                    _LOGGER.debug("Button-Platform verfügbar, wird geladen")
+                except (ModuleNotFoundError, ImportError) as e:
+                    _LOGGER.warning("Button-Platform nicht verfügbar, überspringe sie: %s", e)
+                    continue
+            else:
+                platforms_to_load.append(platform)
+        
+        if platforms_to_load:
+            try:
+                await hass.config_entries.async_forward_entry_setups(entry, platforms_to_load)
+                _LOGGER.info("Platforms erfolgreich geladen: %s", platforms_to_load)
+            except asyncio.CancelledError:
+                _LOGGER.error("Platform-Setup wurde abgebrochen")
+                raise
+            except Exception as platform_error:
+                _LOGGER.error("Fehler beim Laden der Platforms: %s", platform_error, exc_info=True)
+                raise
+        else:
+            _LOGGER.warning("Keine Platforms zum Laden verfügbar")
         _LOGGER.debug("Platforms geladen")
 
         # Registriere Services für Ventilsteuerung
