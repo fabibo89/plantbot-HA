@@ -159,7 +159,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             # Verwende den korrekten Endpoint mit Authentifizierung
             # Nur online Stationen abrufen, um Timeouts zu vermeiden
             endpoint = f"{self.server_url}/api/v1/stations/?online_only=true"
-            endpoint = f"{self.server_url}/api/v1/stations"
+            #endpoint = f"{self.server_url}/api/v1/stations"
             headers = {"Authorization": f"Bearer {self.access_token}"}
             
             stations = None
