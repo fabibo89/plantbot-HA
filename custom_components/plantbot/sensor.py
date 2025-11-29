@@ -128,12 +128,41 @@ async def async_setup_entry(hass, entry, async_add_entities):
                         key = f"{config['prefix']}_{sensor_type}_{addr_str}"
                         props = DYNAMIC_SENSOR_TYPES[f"{config['prefix']}_{sensor_type}"].copy()
                         
-                        # Template verwenden
+                        # Prüfe ob Pflanze für diesen spezifischen Sensor vorhanden ist
+                        # Coordinator speichert Keys als "station_{id}", also müssen wir das prüfen
+                        station_key = station_id if station_id.startswith("station_") else f"station_{station_id}"
+                        station_data = coordinator.data.get(station_key, {})
+                        sensor_mapping = station_data.get("sensor_mapping", {})  # identifier -> plant_name
+                        
+                        # Extrahiere Identifier aus dem Sensor-Key
+                        # Für BT-Sensoren: MAC-Adresse (z.B. "5c:85:7e:b0:ae:e1" aus "BTSensoren_temp_5c:85:7e:b0:ae:e1")
+                        # Für Modbus: Adresse (z.B. "1" aus "modbusSens_hum_1")
+                        sensor_identifier = None
                         if config["addr_format"] == "mac":
-                            addr_short = addr_str[-5:] if len(addr_str) >= 5 else addr_str
-                            props["name"] = props["name_template"].format(mac=addr_short)
+                            # BT-Sensor: Vollständige MAC-Adresse
+                            sensor_identifier = addr_str
                         else:
-                            props["name"] = props["name_template"].format(addr=addr_str)
+                            # Modbus: Adresse
+                            sensor_identifier = addr_str
+                        
+                        _LOGGER.debug("Dynamischer Sensor %s: identifier=%s, sensor_mapping=%s", 
+                                     key, sensor_identifier, sensor_mapping)
+                        
+                        # Prüfe ob dieser Sensor einer Pflanze zugeordnet ist
+                        plant_name = sensor_mapping.get(sensor_identifier)
+                        
+                        if plant_name:
+                            # Sensor ist einer Pflanze zugeordnet: Verwende nur Basis-Name ohne Adresse + Pflanzennamen
+                            props["name"] = f"{props['name_server']} {plant_name}"
+                            _LOGGER.debug("Sensor umbenannt: %s -> %s (Pflanze: %s)", key, props["name"], plant_name)
+                        else:
+                            # Keine Pflanze für diesen Sensor: Template verwenden (mit Adresse/MAC)
+                            if config["addr_format"] == "mac":
+                                addr_short = addr_str[-5:] if len(addr_str) >= 5 else addr_str
+                                props["name"] = props["name_template"].format(mac=addr_short)
+                            else:
+                                props["name"] = props["name_template"].format(addr=addr_str)
+                            _LOGGER.debug("Sensor ohne Pflanze: %s -> %s", key, props["name"])
                         
                         entities.append(PlantbotHASensor(coordinator, station_id, key, props, station_name))
                 
@@ -145,22 +174,81 @@ class PlantbotHASensor(SensorEntity):
         self.station_id = str(station_id)
         self.key = key
         self.station_name = station_name
-        self._attr_name = props['name']
-        self._attr_unique_id = f"{DOMAIN}_{station_id}_{key}"
         self._attr_native_unit_of_measurement = props["unit"]
         self._optional = props["optional"]
         self._attr_device_class = props["device_class"]
         self._attr_state_class = props.get("state_class")
-        self.station_ip = coordinator.data.get(self.station_id, {}).get("ip")
+        # Coordinator speichert Keys als "station_{id}"
+        station_key = self.station_id if self.station_id.startswith("station_") else f"station_{self.station_id}"
+        self.station_ip = coordinator.data.get(station_key, {}).get("ip")
         self._attr_icon = props.get("icon")
         self._props = props
+        
+        # Bestimme Sensor-Namen basierend auf Pflanze (falls vorhanden)
+        base_name = props['name']
+        
+        # Coordinator speichert Keys als "station_{id}", also müssen wir das prüfen
+        station_key = self.station_id if self.station_id.startswith("station_") else f"station_{self.station_id}"
+        station_data = coordinator.data.get(station_key, {})
+        plant_mapping = station_data.get("plant_mapping", {})
+        sensor_mapping = station_data.get("sensor_mapping", {})
+        
+        # Prüfe ob der Name bereits einen Pflanzennamen enthält
+        # (wurde bereits in dynamischer Sensor-Erstellung gesetzt)
+        # Prüfe ob der letzte Teil des Namens ein Pflanzennamen ist
+        name_parts = base_name.split()
+        if len(name_parts) > 1:
+            last_part = name_parts[-1]
+            # Prüfe ob der letzte Teil ein Pflanzennamen ist (entweder in plant_mapping oder sensor_mapping)
+            is_plant_name = (
+                last_part in plant_mapping.values() or 
+                last_part in sensor_mapping.values()
+            )
+            if is_plant_name:
+                # Name enthält bereits einen Pflanzennamen (z.B. "Bodenfeuchtigkeit Gurke")
+                # Verwende ihn direkt, ohne weitere Anpassung
+                self._attr_name = base_name
+                _LOGGER.debug("Sensor-Name bereits mit Pflanze: %s -> %s", self.key, self._attr_name)
+            else:
+                # Name enthält noch keinen Pflanzennamen, prüfe ob wir einen hinzufügen müssen
+                _LOGGER.debug("Sensor %s: station_id=%s, plant_mapping=%s, len=%d", 
+                             self.key, self.station_id, plant_mapping, len(plant_mapping) if plant_mapping else 0)
+                
+                # Für normale Sensoren (nicht dynamische): Wenn genau eine Pflanze vorhanden, verwende sie
+                # Format: "Sensor-Name Pflanze" (z.B. "Temperatur Tomate")
+                if plant_mapping and len(plant_mapping) == 1:
+                    plant_name = list(plant_mapping.values())[0]
+                    self._attr_name = f"{base_name} {plant_name}"
+                    _LOGGER.debug("Sensor umbenannt: %s -> %s (von %d Pflanzen)", self.key, self._attr_name, len(plant_mapping))
+                else:
+                    # Keine Pflanze oder mehrere Pflanzen: Standard-Name
+                    self._attr_name = base_name
+                    _LOGGER.debug("Sensor ohne Pflanze: %s -> %s", self.key, self._attr_name)
+        else:
+            # Name hat nur einen Teil, prüfe ob wir eine Pflanze hinzufügen müssen
+            _LOGGER.debug("Sensor %s: station_id=%s, plant_mapping=%s, len=%d", 
+                         self.key, self.station_id, plant_mapping, len(plant_mapping) if plant_mapping else 0)
+            
+            # Für normale Sensoren (nicht dynamische): Wenn genau eine Pflanze vorhanden, verwende sie
+            if plant_mapping and len(plant_mapping) == 1:
+                plant_name = list(plant_mapping.values())[0]
+                self._attr_name = f"{base_name} {plant_name}"
+                _LOGGER.debug("Sensor umbenannt: %s -> %s (von %d Pflanzen)", self.key, self._attr_name, len(plant_mapping))
+            else:
+                # Keine Pflanze oder mehrere Pflanzen: Standard-Name
+                self._attr_name = base_name
+                _LOGGER.debug("Sensor ohne Pflanze: %s -> %s", self.key, self._attr_name)
+        
+        self._attr_unique_id = f"{DOMAIN}_{station_id}_{key}"
 
     @property
     def native_value(self):
         if not self.available:
             return None
 
-        station_data = self.coordinator.data.get(self.station_id, {})
+        # Coordinator speichert Keys als "station_{id}"
+        station_key = self.station_id if self.station_id.startswith("station_") else f"station_{self.station_id}"
+        station_data = self.coordinator.data.get(station_key, {})
         sensoren = station_data.get("Sensoren", {})
 
         # Vereinheitlichte Sensor-Wert-Abfrage für modbusSens und BTSensoren

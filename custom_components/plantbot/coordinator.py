@@ -159,6 +159,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             # Verwende den korrekten Endpoint mit Authentifizierung
             # Nur online Stationen abrufen, um Timeouts zu vermeiden
             endpoint = f"{self.server_url}/api/v1/stations/?online_only=true"
+            endpoint = f"{self.server_url}/api/v1/stations"
             headers = {"Authorization": f"Bearer {self.access_token}"}
             
             stations = None
@@ -265,32 +266,44 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                                         reason.append("inaktiv")
                                     _LOGGER.debug("Pflanze '%s' übersprungen: %s", plant_name, ", ".join(reason) if reason else "unbekannt")
                             _LOGGER.debug("Pflanzen-Mapping für Station %s: %d Einträge", station_id, len(plant_mapping))
-                        elif response.status == 401:
-                            # Token könnte abgelaufen sein, versuche Refresh
-                            await self._refresh_token()
+                        
+                        # Hole Sensor-Devices vom Server (für Sensor-zu-Pflanze-Zuordnung)
+                        sensor_mapping = {}  # identifier -> plant_name
+                        try:
+                            sensors_endpoint = f"{self.server_url}/api/v1/sensors/devices/station/{station_id}"
                             headers = {"Authorization": f"Bearer {self.access_token}"}
-                            async with self.session.get(plants_endpoint, headers=headers, ssl=False, timeout=10) as retry_response:
-                                if retry_response.status == 200:
-                                    plants = await retry_response.json()
-                                    _LOGGER.debug("Pflanzen-Daten für Station %s nach Token-Refresh erhalten: %s", station_id, plants)
-                                    for plant in plants:
-                                        pump = plant.get("pump_number")
-                                        valve = plant.get("valve_number")
-                                        plant_name = plant.get("name", "")
-                                        is_active = plant.get("is_active", True)
-                                        if pump is not None and valve is not None and is_active:
-                                            try:
-                                                pump_int = int(pump)
-                                                valve_int = int(valve)
-                                                if pump_int > 0 and valve_int > 0:
-                                                    plant_mapping[(pump_int, valve_int)] = plant_name
-                                            except (ValueError, TypeError):
-                                                pass
-                        elif response.status == 404:
-                            _LOGGER.debug("Keine Pflanzen für Station %s gefunden (404)", station_id)
-                        else:
-                            _LOGGER.warning("Unerwarteter Status beim Abrufen der Pflanzen für Station %s: HTTP %s", 
-                                           station_id, response.status)
+                            async with self.session.get(sensors_endpoint, headers=headers, ssl=False, timeout=10) as response:
+                                if response.status == 200:
+                                    sensor_devices = await response.json()
+                                    _LOGGER.debug("Sensor-Devices für Station %s erhalten: %d Devices", station_id, len(sensor_devices))
+                                    for device in sensor_devices:
+                                        identifier = device.get("identifier")
+                                        plant = device.get("plant")
+                                        if identifier and plant:
+                                            plant_name = plant.get("name", "")
+                                            sensor_mapping[identifier] = plant_name
+                                            _LOGGER.debug("Sensor-Device Mapping: %s -> %s", identifier, plant_name)
+                                    _LOGGER.debug("Sensor-Mapping für Station %s: %d Einträge", station_id, len(sensor_mapping))
+                                elif response.status == 401:
+                                    # Token könnte abgelaufen sein, versuche Refresh
+                                    await self._refresh_token()
+                                    headers = {"Authorization": f"Bearer {self.access_token}"}
+                                    async with self.session.get(sensors_endpoint, headers=headers, ssl=False, timeout=10) as retry_response:
+                                        if retry_response.status == 200:
+                                            sensor_devices = await retry_response.json()
+                                            for device in sensor_devices:
+                                                identifier = device.get("identifier")
+                                                plant = device.get("plant")
+                                                if identifier and plant:
+                                                    plant_name = plant.get("name", "")
+                                                    sensor_mapping[identifier] = plant_name
+                                elif response.status == 404:
+                                    _LOGGER.debug("Keine Sensor-Devices für Station %s gefunden (404)", station_id)
+                                else:
+                                    _LOGGER.warning("Unerwarteter Status beim Abrufen der Sensor-Devices für Station %s: HTTP %s", 
+                                                   station_id, response.status)
+                        except Exception as e:
+                            _LOGGER.warning("Fehler beim Abrufen der Sensor-Devices für Station %s: %s", station_id, e, exc_info=True)
                 except Exception as e:
                     _LOGGER.warning("Fehler beim Abrufen der Pflanzen für Station %s: %s", station_id, e, exc_info=True)
                 
@@ -318,6 +331,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                             data["num_valves"] = station.get("num_valves", 8)
                             data["fertilizer_pump_number"] = station.get("fertilizer_pump_number")
                             data["plant_mapping"] = plant_mapping
+                            data["sensor_mapping"] = sensor_mapping  # identifier -> plant_name
                         result.update(device_data)
                 except Exception as e:
                     _LOGGER.warning("Fehler beim Abrufen von Daten von PlantBot %s (%s): %s", station_name, ip, e)
@@ -332,6 +346,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         "num_valves": station.get("num_valves", 8),
                         "fertilizer_pump_number": station.get("fertilizer_pump_number"),
                         "plant_mapping": plant_mapping,
+                        "sensor_mapping": sensor_mapping,  # identifier -> plant_name
                     }
             
             return result
@@ -375,6 +390,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                             data["num_valves"] = 8
                         if "plant_mapping" not in data:
                             data["plant_mapping"] = {}
+                        if "sensor_mapping" not in data:
+                            data["sensor_mapping"] = {}
                         
                         return {f"station_{station_id}": data}
                     else:
