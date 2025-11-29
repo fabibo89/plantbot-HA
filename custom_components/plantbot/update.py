@@ -21,8 +21,9 @@ async def async_setup_entry(hass, entry, async_add_entities):
     entities = []
     
     # Prüfe ob coordinator.data vorhanden ist
-    if coordinator.data is None:
-        _LOGGER.warning("Coordinator data ist None, keine Update-Entities erstellt")
+    if not coordinator.data:
+        _LOGGER.warning("Coordinator hat noch keine Daten, warte auf ersten Update")
+        async_add_entities([])
         return
 
     for station_id, station in coordinator.data.items():

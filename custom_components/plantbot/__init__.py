@@ -44,19 +44,30 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         coordinator = PlantbotHACoordinator(hass, config_data, entry.entry_id)
         _LOGGER.debug("Coordinator erstellt, starte ersten Refresh")
         
+        # Speichere Coordinator zuerst, damit Platforms darauf zugreifen können
+        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
+        _LOGGER.debug("Coordinator zu hass.data hinzugefügt")
+        
+        # Starte ersten Refresh mit Timeout, aber blockiere nicht das Setup
         try:
-            await coordinator.async_config_entry_first_refresh()
+            await asyncio.wait_for(coordinator.async_config_entry_first_refresh(), timeout=30.0)
             _LOGGER.debug("Erster Refresh erfolgreich")
+        except asyncio.TimeoutError:
+            _LOGGER.warning("Timeout beim ersten Refresh (wird bei nächstem Update erneut versucht)")
+            # Erstelle trotzdem einen Eintrag, damit die Integration geladen wird
+        except asyncio.CancelledError:
+            _LOGGER.warning("Erster Refresh abgebrochen (wird bei nächstem Update erneut versucht)")
         except Exception as refresh_error:
             _LOGGER.warning("Fehler beim ersten Refresh (wird bei nächstem Update erneut versucht): %s", refresh_error)
             # Erstelle trotzdem einen Eintrag, damit die Integration geladen wird
             # Der Coordinator wird bei den nächsten Updates versuchen, die Daten zu holen
         
-        hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-        _LOGGER.debug("Coordinator zu hass.data hinzugefügt")
-        
+        # Lade Platforms - auch wenn Refresh fehlgeschlagen ist
         try:
             await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+        except asyncio.CancelledError:
+            _LOGGER.error("Platform-Setup wurde abgebrochen")
+            raise
         except Exception as platform_error:
             _LOGGER.error("Fehler beim Laden der Platforms: %s", platform_error, exc_info=True)
             raise
