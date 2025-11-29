@@ -224,6 +224,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 
                 # Hole Pflanzen für diese Station
                 plant_mapping = {}
+                sensor_mapping = {}  # identifier -> plant_name
+                jobs_count = 0  # Anzahl pending Jobs
                 _LOGGER.debug("Hole Pflanzen für Station ID: %s (Typ: %s), Name: %s, IP: %s", 
                              station_id, type(station_id).__name__, station_name, ip)
                 try:
@@ -304,8 +306,37 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                                                    station_id, response.status)
                         except Exception as e:
                             _LOGGER.warning("Fehler beim Abrufen der Sensor-Devices für Station %s: %s", station_id, e, exc_info=True)
+                        
+                        # Hole Jobs (Warteschlange) vom Server
+                        jobs_count = 0
+                        try:
+                            jobs_endpoint = f"{self.server_url}/api/v1/watering/jobs?station_id={station_id}&status=pending&limit=100"
+                            headers = {"Authorization": f"Bearer {self.access_token}"}
+                            async with self.session.get(jobs_endpoint, headers=headers, ssl=False, timeout=10) as response:
+                                if response.status == 200:
+                                    jobs = await response.json()
+                                    jobs_count = len(jobs)
+                                    _LOGGER.debug("Jobs für Station %s erhalten: %d pending Jobs", station_id, jobs_count)
+                                elif response.status == 401:
+                                    # Token könnte abgelaufen sein, versuche Refresh
+                                    await self._refresh_token()
+                                    headers = {"Authorization": f"Bearer {self.access_token}"}
+                                    async with self.session.get(jobs_endpoint, headers=headers, ssl=False, timeout=10) as retry_response:
+                                        if retry_response.status == 200:
+                                            jobs = await retry_response.json()
+                                            jobs_count = len(jobs)
+                                elif response.status == 404:
+                                    _LOGGER.debug("Keine Jobs für Station %s gefunden (404)", station_id)
+                                else:
+                                    _LOGGER.debug("Unerwarteter Status beim Abrufen der Jobs für Station %s: HTTP %s", 
+                                                 station_id, response.status)
+                        except Exception as e:
+                            _LOGGER.warning("Fehler beim Abrufen der Jobs für Station %s: %s", station_id, e, exc_info=True)
+                        
                 except Exception as e:
                     _LOGGER.warning("Fehler beim Abrufen der Pflanzen für Station %s: %s", station_id, e, exc_info=True)
+                    jobs_count = 0  # Fallback
+                    sensor_mapping = {}  # Fallback
                 
                 try:
                     device_data = await self._fetch_from_device(ip)
@@ -332,6 +363,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                             data["fertilizer_pump_number"] = station.get("fertilizer_pump_number")
                             data["plant_mapping"] = plant_mapping
                             data["sensor_mapping"] = sensor_mapping  # identifier -> plant_name
+                            data["jobs"] = jobs_count  # Anzahl pending Jobs in Warteschlange
                         result.update(device_data)
                 except Exception as e:
                     _LOGGER.warning("Fehler beim Abrufen von Daten von PlantBot %s (%s): %s", station_name, ip, e)
@@ -347,6 +379,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         "fertilizer_pump_number": station.get("fertilizer_pump_number"),
                         "plant_mapping": plant_mapping,
                         "sensor_mapping": sensor_mapping,  # identifier -> plant_name
+                        "jobs": jobs_count,  # Anzahl pending Jobs in Warteschlange
                     }
             
             return result
@@ -372,26 +405,18 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         # Normalisiere station_id
                         if isinstance(station_id, str) and station_id.startswith("station_"):
                             station_id = station_id.replace("station_", "")
-                        elif station_id is None:
-                            station_id = ip
+                        station_id = station_id or ip
                         
                         data["source"] = "device"
                         data["ip"] = ip
                         data["id"] = str(station_id)
                         
-                        # Stelle sicher, dass Sensoren-Objekt vorhanden ist
-                        if "Sensoren" not in data:
-                            data["Sensoren"] = {}
-                        
-                        # Für Device-Modus: Standard-Werte setzen (können später vom Server kommen)
-                        if "num_pumps" not in data:
-                            data["num_pumps"] = 1
-                        if "num_valves" not in data:
-                            data["num_valves"] = 8
-                        if "plant_mapping" not in data:
-                            data["plant_mapping"] = {}
-                        if "sensor_mapping" not in data:
-                            data["sensor_mapping"] = {}
+                        # Stelle sicher, dass alle benötigten Felder vorhanden sind
+                        data.setdefault("Sensoren", {})
+                        data.setdefault("num_pumps", 1)
+                        data.setdefault("num_valves", 8)
+                        data.setdefault("plant_mapping", {})
+                        data.setdefault("sensor_mapping", {})
                         
                         return {f"station_{station_id}": data}
                     else:
@@ -406,6 +431,20 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         except Exception as e:
             _LOGGER.error("Fehler beim Zugriff auf %s: %s", endpoint, e)
             raise UpdateFailed(f"Fehler beim Abrufen von PlantBot {ip}: {e}")
+
+    def _get_mqtt_client_config(self, client_id):
+        """Erstelle MQTT-Client-Konfiguration (wiederverwendbar)."""
+        client_kwargs = {
+            "hostname": self.mqtt_broker,
+            "port": self.mqtt_port,
+            "identifier": client_id,
+        }
+        # Nur Username/Password hinzufügen, wenn sie gesetzt sind
+        if self.mqtt_username:
+            client_kwargs["username"] = self.mqtt_username
+        if self.mqtt_password:
+            client_kwargs["password"] = self.mqtt_password
+        return client_kwargs
 
     async def send_valve_command(self, ip, pump_number, valve_id, command, **kwargs):
         """Sende Ventil-Befehl an PlantBot über MQTT."""
@@ -434,17 +473,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             
             # Erstelle MQTT-Client für diesen Befehl
             client_id = f"plantbot_{self.entry_id or 'default'}_{id(self)}"
-            client_kwargs = {
-                "hostname": self.mqtt_broker,
-                "port": self.mqtt_port,
-                "identifier": client_id,
-            }
-            
-            # Nur Username/Password hinzufügen, wenn sie gesetzt sind
-            if self.mqtt_username:
-                client_kwargs["username"] = self.mqtt_username
-            if self.mqtt_password:
-                client_kwargs["password"] = self.mqtt_password
+            client_kwargs = self._get_mqtt_client_config(client_id)
             
             async with MQTTClient(**client_kwargs) as client:
                 await client.publish(topic, payload_json, qos=1)
@@ -474,17 +503,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         while True:
             try:
                 # Erstelle Client-Konfiguration
-                client_kwargs = {
-                    "hostname": self.mqtt_broker,
-                    "port": self.mqtt_port,
-                    "identifier": client_id,
-                }
-                
-                # Nur Username/Password hinzufügen, wenn sie gesetzt sind
-                if self.mqtt_username:
-                    client_kwargs["username"] = self.mqtt_username
-                if self.mqtt_password:
-                    client_kwargs["password"] = self.mqtt_password
+                client_kwargs = self._get_mqtt_client_config(client_id)
                 
                 _LOGGER.debug("Verbinde MQTT-Client mit: %s", client_kwargs)
                 self._mqtt_subscribe_client = MQTTClient(**client_kwargs)
@@ -656,8 +675,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 
                 if pump_number and valve_number:
                     # Stelle sicher, dass valves Array existiert
-                    if "valves" not in station:
-                        station["valves"] = []
+                    station.setdefault("valves", [])
                     
                     # Suche nach vorhandenem Ventil oder erstelle neues
                     valve_found = False
@@ -733,8 +751,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 
                 if pump_number and valve_number and status in ["completed", "failed", "cancelled"]:
                     # Stelle sicher, dass valves Array existiert
-                    if "valves" not in station:
-                        station["valves"] = []
+                    station.setdefault("valves", [])
                     
                     # Suche nach vorhandenem Ventil und setze auf closed
                     valve_found = False
