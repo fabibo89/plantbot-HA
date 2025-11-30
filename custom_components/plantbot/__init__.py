@@ -95,6 +95,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         _LOGGER.debug("Platforms geladen")
 
         # Registriere Services für Ventilsteuerung
+        # Die services.yaml wird automatisch von Home Assistant geladen
         hass.services.async_register(DOMAIN, "open_for_seconds", handle_open_for_seconds)
         hass.services.async_register(DOMAIN, "open_for_volume", handle_open_for_volume)
         _LOGGER.info("PlantBot HA Integration erfolgreich geladen")
