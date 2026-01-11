@@ -64,6 +64,36 @@
         }
       }
     }
+  },
+  "services": {
+    "open_for_seconds": {
+      "name": "Öffne für Sekunden",
+      "description": "Öffnet ein Ventil für eine bestimmte Zeitdauer.",
+      "fields": {
+        "valve": {
+          "name": "Ventil",
+          "description": "Wähle ein Ventil aus deiner Installation"
+        },
+        "duration": {
+          "name": "Zeit",
+          "description": "Wie lange soll gegossen werden?"
+        }
+      }
+    },
+    "open_for_volume": {
+      "name": "Öffne für Volumen",
+      "description": "Öffnet ein Ventil, bis eine bestimmte Menge Wasser geflossen ist.",
+      "fields": {
+        "valve": {
+          "name": "Ventil",
+          "description": "Wähle ein Ventil aus deiner Installation"
+        },
+        "volume": {
+          "name": "Volumen",
+          "description": "Welches Volumen soll gegossen werden?"
+        }
+      }
+    }
   }
 }
 

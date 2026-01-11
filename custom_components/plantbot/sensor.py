@@ -1,6 +1,6 @@
 import logging
 from homeassistant.components.sensor import SensorEntity
-from homeassistant.const import UnitOfTemperature, PERCENTAGE
+from homeassistant.const import UnitOfTemperature, PERCENTAGE, UnitOfLength
 from homeassistant.components.sensor import SensorDeviceClass, SensorStateClass
 from homeassistant.const import SIGNAL_STRENGTH_DECIBELS_MILLIWATT
 from homeassistant.const import UnitOfPressure
@@ -36,11 +36,9 @@ def _plantbot_value_is_valid(props, value):
 
 SENSOR_TYPES = {
     "temp": {"name": "Temperatur", "unit": UnitOfTemperature.CELSIUS, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, 'valid_range': (-30.0, 60.0)},
-    "temperature": {"name": "Temperatur", "unit": UnitOfTemperature.CELSIUS, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, 'valid_range': (-30.0, 60.0)},
     "hum": {"name": "Feuchtigkeit", "unit": PERCENTAGE, "device_class": SensorDeviceClass.HUMIDITY, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, 'valid_range': (0.0, 100.0)},
-    "humidity": {"name": "Feuchtigkeit", "unit": PERCENTAGE, "device_class": SensorDeviceClass.HUMIDITY, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, 'valid_range': (0.0, 100.0)},
-    "pressure": {"name": "Luftdruck", "unit": UnitOfPressure.HPA, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, "icon": "mdi:gauge", 'valid_range': (800.0, 1100.0)},
-    "water_level": {"name": "Wasserstand", "unit": PERCENTAGE, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, 'valid_range': (0.0, 100.0)},
+    "pres": {"name": "Luftdruck", "unit": UnitOfPressure.HPA, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, "icon": "mdi:gauge", 'valid_range': (800.0, 1100.0)},
+    "water_level": {"name": "Wasserstand", "unit": UnitOfLength.CENTIMETERS, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, 'valid_range': (0.0, 100.0)},
     "jobs": {"name": "Jobs", "unit": "count", "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:playlist-play", "ignore_zero": False},
     "flow": {"name": "Flow", "unit": None, "device_class": None, "state_class": SensorStateClass.TOTAL, "optional": True, "icon": "mdi:water-pump"},
     "lastVolume": {"name": "Volume", "unit": 'ml', "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:water"},
@@ -56,9 +54,9 @@ SENSOR_TYPES = {
 
 DYNAMIC_SENSOR_TYPES = {
     "modbusSens_hum": {"name_template": "Bodenfeuchtigkeit MB {addr}", "name_server": "Bodenfeuchtigkeit", "unit": PERCENTAGE, "optional": True, "device_class": SensorDeviceClass.HUMIDITY, "state_class": SensorStateClass.MEASUREMENT, "valid_range": (5.0, 100.0)},
-    "modbusSens_temp": {"name_template": "Bodentemperatur MB {addr}", "name_server": "Bodentemperatur", "unit": UnitOfTemperature.CELSIUS, "optional": True, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "ignore_zero": True, "valid_range": (-10.0, 100.0)},
+    "modbusSens_temp": {"name_template": "Bodentemperatur MB {addr}", "name_server": "Bodentemperatur", "unit": UnitOfTemperature.CELSIUS, "optional": True, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "ignore_zero": False, "valid_range": (-10.0, 100.0)},
     "modbusSens_cond": {"name_template": "Bodenleitfähigkeit MB {addr}", "name_server": "Bodenleitfähigkeit", "unit": "µS/cm", "optional": True, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "icon": "mdi:flash", "valid_range": (0.0, 5000.0)},
-    "BTSensoren_temp": {"name_template": "Temperatur BT {mac}", "name_server": "Bodentemperatur", "unit": UnitOfTemperature.CELSIUS, "optional": True, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "ignore_zero": True, "valid_range": (-10.0, 100.0)},
+    "BTSensoren_temp": {"name_template": "Temperatur BT {mac}", "name_server": "Bodentemperatur", "unit": UnitOfTemperature.CELSIUS, "optional": True, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "ignore_zero": False, "valid_range": (-10.0, 100.0)},
     "BTSensoren_hum": {"name_template": "Bodenfeuchtigkeit BT {mac}", "name_server": "Bodenfeuchtigkeit", "unit": PERCENTAGE, "optional": True, "device_class": SensorDeviceClass.HUMIDITY, "state_class": SensorStateClass.MEASUREMENT, "valid_range": (5.0, 100.0)},
     "BTSensoren_bat": {"name_template": "Batterie BT {mac}", "name_server": "Batterie", "unit": PERCENTAGE, "optional": True, "device_class": SensorDeviceClass.BATTERY, "state_class": SensorStateClass.MEASUREMENT, "valid_range": (0.0, 100.0)},
     "BTSensoren_con": {"name_template": "Bodenleitfähigkeit BT {mac}", "name_server": "Bodenleitfähigkeit", "unit": "µS/cm", "optional": True, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "icon": "mdi:flash", "valid_range": (0.0, 5000.0)},
