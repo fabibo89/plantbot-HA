@@ -11,6 +11,9 @@ from aiomqtt.exceptions import MqttError
 
 _LOGGER = logging.getLogger(__name__)
 
+# Sekunden für GET http://<ip>/status (ESP/Webserver kann unter Last >5s brauchen)
+STATUS_REQUEST_TIMEOUT = 15
+
 class PlantbotHACoordinator(DataUpdateCoordinator):
     def __init__(self, hass, config_data, entry_id=None):
         self.hass = hass
@@ -394,7 +397,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         endpoint = f"http://{ip}/status"
         
         try:
-            async with self.session.get(endpoint, ssl=False, timeout=5) as response:
+            async with self.session.get(
+                endpoint, ssl=False, timeout=STATUS_REQUEST_TIMEOUT
+            ) as response:
                 if response.status == 200:
                     data = await response.json()
                     _LOGGER.debug("Daten von PlantBot %s erhalten (GET /status): %s", ip, data)
