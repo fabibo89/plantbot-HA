@@ -13,3 +13,7 @@ Diese Integration verbindet Home Assistant mit deinem PlantBot-Bewässerungssyst
 - Automatisches Erkennen von Stationen und Ventilen
 - Temperatur- und Feuchtesensoren
 - Steuerung von Ventilen über Switches
+
+## Release Notes
+
+Siehe [RELEASE_NOTES_1.2.9-epsilon.md](RELEASE_NOTES_1.2.9-epsilon.md).
