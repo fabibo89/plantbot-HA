@@ -89,7 +89,10 @@ class PlantBotResetButton(ButtonEntity):
 
     @property
     def available(self):
-        return self.coordinator.last_update_success
+        if not self.coordinator.data or self.station_id not in self.coordinator.data:
+            return False
+        station_data = self.coordinator.data[self.station_id]
+        return bool(station_data.get("available", True))
 
     async def async_update(self):
         await self.coordinator.async_request_refresh()

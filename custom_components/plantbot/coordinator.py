@@ -60,6 +60,16 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             if not isinstance(result, dict):
                 _LOGGER.warning("Unerwartetes Ergebnis-Format: %s, verwende leeres Dict", type(result))
                 result = {}
+
+            # Wenn wir gerade keine Daten bekommen (z.B. kurzfristiger Timeout),
+            # liefere die letzten bekannten Daten zurück, damit Entities nicht "flackern"
+            # und z.B. Update-Entities nicht kurzfristig "No update available" werden.
+            if not result and isinstance(self.data, dict) and self.data:
+                _LOGGER.warning(
+                    "Datenabruf lieferte leeres Ergebnis – verwende gecachte Daten (%d Stationen)",
+                    len(self.data),
+                )
+                result = self.data
             
             # Starte MQTT-Subscribe nach erstem erfolgreichen Update
             # Verwende result oder vorhandene Daten (falls result leer ist wegen Timeouts)
@@ -71,16 +81,27 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             return result
         except asyncio.CancelledError:
             _LOGGER.warning("Abbruch während Datenabruf – vermutlich durch Shutdown oder Timeout")
-            self.last_update_success = False
-            return {}  # Rückgabe leeres Dict statt Exception
+            # Beim Cancel (z.B. Shutdown) lieber gecachte Daten behalten.
+            return self.data if isinstance(self.data, dict) else {}
         except aiohttp.ClientError as err:
             _LOGGER.error("Verbindung zu PlantBot fehlgeschlagen: %s", err)
-            self.last_update_success = False
-            return {}  # Rückgabe leeres Dict statt Exception
+            # Kurzzeitige Netzwerkfehler sollen Entities nicht "leeren".
+            if isinstance(self.data, dict) and self.data:
+                _LOGGER.warning(
+                    "Verwende gecachte Daten nach ClientError (%d Stationen)",
+                    len(self.data),
+                )
+                return self.data
+            return {}
         except Exception as err:
             _LOGGER.exception("Fehler bei der Kommunikation mit PlantBot:")
-            self.last_update_success = False
-            return {}  # Rückgabe leeres Dict statt Exception
+            if isinstance(self.data, dict) and self.data:
+                _LOGGER.warning(
+                    "Verwende gecachte Daten nach Exception (%d Stationen)",
+                    len(self.data),
+                )
+                return self.data
+            return {}
 
     async def _ensure_token_valid(self):
         """Stelle sicher, dass der Access Token gültig ist, refreshe falls nötig."""
@@ -415,6 +436,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         data["source"] = "device"
                         data["ip"] = ip
                         data["id"] = str(station_id)
+                        data["available"] = True
                         
                         # Stelle sicher, dass alle benötigten Felder vorhanden sind
                         data.setdefault("Sensoren", {})
@@ -426,16 +448,70 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         return {f"station_{station_id}": data}
                     else:
                         _LOGGER.warning("Unerwartetes Datenformat von %s: %s", endpoint, type(data))
-                        raise UpdateFailed(f"Unerwartetes Datenformat von PlantBot {ip}")
+                        # Treat as offline-ish but keep cached data
+                        station_id = ip
+                        cached = {}
+                        if isinstance(self.data, dict):
+                            cached = (self.data.get(f"station_{station_id}") or {}).copy()
+                        cached.update(
+                            {
+                                "source": cached.get("source", "device"),
+                                "ip": ip,
+                                "id": str(station_id),
+                                "available": False,
+                                "offline_reason": "bad_payload",
+                            }
+                        )
+                        return {f"station_{station_id}": cached}
                 else:
-                    _LOGGER.error("Fehler beim Abrufen von %s: HTTP %s", endpoint, response.status)
-                    raise UpdateFailed(f"Fehler beim Abrufen von PlantBot {ip}: HTTP {response.status}")
+                    _LOGGER.warning("PlantBot %s nicht erreichbar: HTTP %s", ip, response.status)
+                    station_id = ip
+                    cached = {}
+                    if isinstance(self.data, dict):
+                        cached = (self.data.get(f"station_{station_id}") or {}).copy()
+                    cached.update(
+                        {
+                            "source": cached.get("source", "device"),
+                            "ip": ip,
+                            "id": str(station_id),
+                            "available": False,
+                            "offline_reason": f"http_{response.status}",
+                        }
+                    )
+                    return {f"station_{station_id}": cached}
         except asyncio.TimeoutError:
-            _LOGGER.error("Timeout beim Zugriff auf %s", endpoint)
-            raise UpdateFailed(f"Timeout beim Abrufen von PlantBot {ip}")
+            _LOGGER.warning("PlantBot %s offline (Timeout %ss)", ip, STATUS_REQUEST_TIMEOUT)
+            station_id = ip
+            cached = {}
+            if isinstance(self.data, dict):
+                cached = (self.data.get(f"station_{station_id}") or {}).copy()
+            cached.update(
+                {
+                    "source": cached.get("source", "device"),
+                    "ip": ip,
+                    "id": str(station_id),
+                    "available": False,
+                    "offline_reason": "timeout",
+                }
+            )
+            return {f"station_{station_id}": cached}
         except Exception as e:
-            _LOGGER.error("Fehler beim Zugriff auf %s: %s", endpoint, e)
-            raise UpdateFailed(f"Fehler beim Abrufen von PlantBot {ip}: {e}")
+            # Common when device is offline/rebooting; don't raise UpdateFailed to avoid ERROR tracebacks.
+            _LOGGER.warning("PlantBot %s offline (%s)", ip, e)
+            station_id = ip
+            cached = {}
+            if isinstance(self.data, dict):
+                cached = (self.data.get(f"station_{station_id}") or {}).copy()
+            cached.update(
+                {
+                    "source": cached.get("source", "device"),
+                    "ip": ip,
+                    "id": str(station_id),
+                    "available": False,
+                    "offline_reason": "error",
+                }
+            )
+            return {f"station_{station_id}": cached}
 
     def _get_mqtt_client_config(self, client_id):
         """Erstelle MQTT-Client-Konfiguration (wiederverwendbar)."""
@@ -569,6 +645,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 # Topics für diese Station
                 logs_topic = f"plantbot/{ip}/logs"
                 ack_topic = f"plantbot/{ip}/ack"
+                update_topic = f"plantbot/{ip}/update"
                 
                 # Subscribe auf logs
                 if logs_topic not in self._subscribed_topics:
@@ -593,6 +670,18 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         _LOGGER.warning("Fehler beim Subscribe auf %s: %s", ack_topic, e)
                 else:
                     _LOGGER.debug("Bereits subscribed auf %s", ack_topic)
+
+                # Subscribe auf update status (OTA)
+                if update_topic not in self._subscribed_topics:
+                    try:
+                        await self._mqtt_subscribe_client.subscribe(update_topic, qos=1)
+                        self._subscribed_topics.add(update_topic)
+                        _LOGGER.info("Subscribed auf %s", update_topic)
+                        subscribed_count += 1
+                    except Exception as e:
+                        _LOGGER.warning("Fehler beim Subscribe auf %s: %s", update_topic, e)
+                else:
+                    _LOGGER.debug("Bereits subscribed auf %s", update_topic)
             
             _LOGGER.info("MQTT-Subscribe abgeschlossen: %d Topics abonniert", subscribed_count)
         except Exception as e:
@@ -610,7 +699,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 return
             
             ip = parts[1]
-            message_type = parts[2]  # "logs" oder "ack"
+            message_type = parts[2]  # "logs" | "ack" | "update"
             
             # Finde Station anhand IP
             station_id = None
@@ -633,6 +722,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             elif message_type == "ack":
                 _LOGGER.debug("Verarbeite ACK-Nachricht für Station %s", station_id)
                 await self._handle_ack_message(station_id, station_data, data)
+            elif message_type == "update":
+                _LOGGER.debug("Verarbeite Update-Status für Station %s", station_id)
+                await self._handle_update_message(station_id, station_data, data)
             else:
                 _LOGGER.warning("Unbekannter MQTT-Message-Typ: %s (Topic: %s)", message_type, topic)
             
@@ -801,4 +893,28 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 await self.async_request_refresh()
         except Exception as e:
             _LOGGER.error("Fehler beim Verarbeiten der ACK-Nachricht: %s", e)
+
+    async def _handle_update_message(self, station_id, station_data, update_data):
+        """Verarbeite Update-Status (OTA) via MQTT."""
+        try:
+            if not self.data:
+                return
+
+            updated_data = self.data.copy()
+            if station_id not in updated_data:
+                return
+
+            station = updated_data[station_id].copy()
+            station["firmware_update"] = update_data
+            updated_data[station_id] = station
+            self.async_set_updated_data(updated_data)
+
+            status = str(update_data.get("status", ""))
+            progress = str(update_data.get("progress", 0))
+            if status.lower() in ["done", "complete", "success", "failed", "error", "started"]:
+                _LOGGER.info("Station %s: Update-Status via MQTT: %s (%s%%)", station_id, status, progress)
+            else:
+                _LOGGER.debug("Station %s: Update-Status via MQTT: %s (%s%%)", station_id, status, progress)
+        except Exception as e:
+            _LOGGER.error("Fehler beim Verarbeiten der Update-Status-Nachricht: %s", e)
 

@@ -87,7 +87,10 @@ class PlantbotHAValve(ValveEntity):
 
     @property
     def available(self):
-        return self.coordinator.last_update_success and self._get_valve() is not None
+        if not self.coordinator.data or self.station_id not in self.coordinator.data:
+            return False
+        station_data = self.coordinator.data[self.station_id]
+        return bool(station_data.get("available", True)) and self._get_valve() is not None
 
     def _get_valve(self):
         """Hole Ventil-Status vom PlantBot /status Endpoint."""
