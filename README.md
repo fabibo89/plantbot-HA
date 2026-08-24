@@ -16,4 +16,4 @@ Diese Integration verbindet Home Assistant mit deinem PlantBot-Bewässerungssyst
 
 ## Release Notes
 
-Siehe [RELEASE_NOTES_1.2.9-epsilon.md](RELEASE_NOTES_1.2.9-epsilon.md).
+Siehe [`docs/releases/`](docs/releases/) (z. B. [v1.2.10-alpha](docs/releases/v1.2.10-alpha.md)).

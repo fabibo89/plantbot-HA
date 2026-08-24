@@ -1,0 +1,6 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Release notes stay in the repo for history, but are excluded from
+# GitHub "Source code" zip/tarball downloads (git archive).
+docs/releases/** export-ignore
