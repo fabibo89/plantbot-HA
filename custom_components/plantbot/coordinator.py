@@ -6,13 +6,18 @@ from .const import DOMAIN
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import asyncio
 import json
+import time
 from aiomqtt import Client as MQTTClient
 from aiomqtt.exceptions import MqttError
 
 _LOGGER = logging.getLogger(__name__)
 
-# Sekunden für GET http://<ip>/status (ESP/Webserver kann unter Last >5s brauchen)
+# Legacy HTTP /status (nur noch Fallback / OTA-Hilfen)
 STATUS_REQUEST_TIMEOUT = 15
+# Station gilt als offline, wenn länger keine MQTT-Nachricht kam
+MQTT_STALE_SECONDS = 120
+# Gelegentlicher Snapshot-Request statt HTTP-Polling
+MQTT_STATUS_REQUEST_INTERVAL = 300
 
 class PlantbotHACoordinator(DataUpdateCoordinator):
     def __init__(self, hass, config_data, entry_id=None):
@@ -37,12 +42,14 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         self._mqtt_subscribe_client = None
         self._mqtt_subscribe_task = None
         self._subscribed_topics = set()  # Track subscribed topics
+        self._last_status_request = 0.0
         
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=timedelta(seconds=30),
+            # Server-Metadaten periodisch; Live-Daten kommen per MQTT
+            update_interval=timedelta(seconds=60),
         )
 
     async def _async_update_data(self):
@@ -53,8 +60,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 _LOGGER.info("Rufe _fetch_from_server auf")
                 result = await self._fetch_from_server()
             else:  # connection_type == "device"
-                _LOGGER.info("Rufe _fetch_from_device auf für IP: %s", self.device_ip)
-                result = await self._fetch_from_device(self.device_ip)
+                _LOGGER.info("Baue Device-Station für IP: %s", self.device_ip)
+                result = self._build_device_station(self.device_ip)
             
             # Stelle sicher, dass result ein Dictionary ist
             if not isinstance(result, dict):
@@ -70,6 +77,15 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                     len(self.data),
                 )
                 result = self.data
+
+            self._refresh_mqtt_availability(result)
+
+            # Gelegentlich Snapshot per MQTT anfordern (statt HTTP /status)
+            if result and self.mqtt_broker:
+                now = time.time()
+                if now - self._last_status_request >= MQTT_STATUS_REQUEST_INTERVAL:
+                    self._last_status_request = now
+                    self.hass.async_create_task(self._request_status_all(result))
             
             # Starte MQTT-Subscribe nach erstem erfolgreichen Update
             # Verwende result oder vorhandene Daten (falls result leer ist wegen Timeouts)
@@ -363,35 +379,50 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                     sensor_mapping = {}  # Fallback
                 
                 try:
-                    device_data = await self._fetch_from_device(ip)
-                    # Füge Server-Metadaten hinzu
-                    if device_data:
-                        # Stelle sicher, dass wir den korrekten Key verwenden (basierend auf station_id)
-                        result_key = f"station_{station_id}"
-                        # Wenn device_data einen anderen Key hat, verwenden wir unseren Key
-                        if result_key not in device_data and device_data:
-                            # Nimm die Daten aus dem ersten (und einzigen) Eintrag
-                            data = list(device_data.values())[0]
-                            device_data = {result_key: data}
-                        
-                        for key, data in device_data.items():
-                            data["server_id"] = station_id
-                            data["server_name"] = station_name
-                            # Verwende Server-Namen statt Device-Namen (IP)
-                            if station_name:
-                                data["name"] = station_name
-                            data["source"] = "server"
-                            # Füge Hardware-Metadaten hinzu
-                            data["num_pumps"] = station.get("num_pumps", 1)
-                            data["num_valves"] = station.get("num_valves", 8)
-                            data["fertilizer_pump_number"] = station.get("fertilizer_pump_number")
-                            data["plant_mapping"] = plant_mapping
-                            data["sensor_mapping"] = sensor_mapping  # identifier -> plant_name
-                            data["jobs"] = jobs_count  # Anzahl pending Jobs in Warteschlange
-                        result.update(device_data)
+                    result_key = f"station_{station_id}"
+                    existing = {}
+                    if isinstance(self.data, dict):
+                        existing = (self.data.get(result_key) or {}).copy()
+
+                    station_entry = {
+                        "id": station_id,
+                        "name": station_name,
+                        "ip": ip,
+                        "source": "server",
+                        "available": existing.get("available", False),
+                        "num_pumps": station.get("num_pumps", 1),
+                        "num_valves": station.get("num_valves", 8),
+                        "fertilizer_pump_number": station.get("fertilizer_pump_number"),
+                        "plant_mapping": plant_mapping,
+                        "sensor_mapping": sensor_mapping,
+                        "jobs": jobs_count,
+                    }
+                    # Live-Daten aus MQTT behalten
+                    for field in (
+                        "Sensoren",
+                        "valves",
+                        "status",
+                        "wifi",
+                        "flow",
+                        "lastVolume",
+                        "water_runtime",
+                        "runtime",
+                        "memory_usage",
+                        "current_version",
+                        "update_needed",
+                        "last_mqtt_seen",
+                        "firmware_update",
+                        "watering_status",
+                        "last_log",
+                        "last_ack",
+                        "current_watering_volume",
+                        "current_watering_duration",
+                    ):
+                        if field in existing:
+                            station_entry[field] = existing[field]
+                    result[result_key] = station_entry
                 except Exception as e:
-                    _LOGGER.warning("Fehler beim Abrufen von Daten von PlantBot %s (%s): %s", station_name, ip, e)
-                    # Erstelle trotzdem einen Eintrag mit Server-Daten
+                    _LOGGER.warning("Fehler beim Aufbauen der Station %s (%s): %s", station_name, ip, e)
                     result[f"station_{station_id}"] = {
                         "id": station_id,
                         "name": station_name,
@@ -402,8 +433,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         "num_valves": station.get("num_valves", 8),
                         "fertilizer_pump_number": station.get("fertilizer_pump_number"),
                         "plant_mapping": plant_mapping,
-                        "sensor_mapping": sensor_mapping,  # identifier -> plant_name
-                        "jobs": jobs_count,  # Anzahl pending Jobs in Warteschlange
+                        "sensor_mapping": sensor_mapping,
+                        "jobs": jobs_count,
                     }
             
             return result
@@ -412,8 +443,87 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             _LOGGER.error("Fehler beim Abrufen vom Server: %s", e, exc_info=True)
             return result  # Rückgabe leeres Dict statt Exception
 
+    def _build_device_station(self, ip):
+        """Station-Eintrag für Direct-Device-Modus (Live-Daten kommen per MQTT)."""
+        result_key = f"station_{ip}"
+        existing = {}
+        if isinstance(self.data, dict):
+            existing = (self.data.get(result_key) or {}).copy()
+        station_entry = {
+            "id": str(ip),
+            "name": existing.get("name", ip),
+            "ip": ip,
+            "source": "device",
+            "available": existing.get("available", False),
+            "num_pumps": existing.get("num_pumps", 1),
+            "num_valves": existing.get("num_valves", 8),
+            "plant_mapping": existing.get("plant_mapping", {}),
+            "sensor_mapping": existing.get("sensor_mapping", {}),
+            "Sensoren": existing.get("Sensoren", {}),
+            "valves": existing.get("valves", []),
+        }
+        for field in (
+            "status",
+            "wifi",
+            "flow",
+            "lastVolume",
+            "water_runtime",
+            "runtime",
+            "memory_usage",
+            "current_version",
+            "update_needed",
+            "last_mqtt_seen",
+            "firmware_update",
+            "watering_status",
+        ):
+            if field in existing:
+                station_entry[field] = existing[field]
+        return {result_key: station_entry}
+
+    def _refresh_mqtt_availability(self, stations):
+        """Setze available anhand des letzten MQTT-Timestamps."""
+        if not isinstance(stations, dict):
+            return
+        now = time.time()
+        for station in stations.values():
+            last_seen = station.get("last_mqtt_seen")
+            if last_seen:
+                station["available"] = (now - float(last_seen)) <= MQTT_STALE_SECONDS
+            elif "available" not in station:
+                station["available"] = False
+
+    def _touch_mqtt_seen(self, station):
+        station["last_mqtt_seen"] = time.time()
+        station["available"] = True
+
+    async def _request_status_all(self, stations_data):
+        """Fordere sensors+status+valves Snapshot von allen Stationen an."""
+        for station_data in (stations_data or {}).values():
+            ip = station_data.get("ip")
+            if ip:
+                await self.request_status_snapshot(ip)
+
+    async def request_status_snapshot(self, ip):
+        """Sende status_request an eine Station."""
+        if not self.mqtt_broker:
+            return False
+        topic = f"plantbot/{ip}/commands/status_request"
+        try:
+            if self._mqtt_subscribe_client:
+                await self._mqtt_subscribe_client.publish(topic, b"{}", qos=1)
+            else:
+                client_id = f"plantbot_req_{self.entry_id or 'default'}_{id(self)}"
+                client_kwargs = self._get_mqtt_client_config(client_id)
+                async with MQTTClient(**client_kwargs) as client:
+                    await client.publish(topic, b"{}", qos=1)
+            _LOGGER.info("status_request gesendet: %s", topic)
+            return True
+        except Exception as e:
+            _LOGGER.warning("status_request fehlgeschlagen für %s: %s", ip, e)
+            return False
+
     async def _fetch_from_device(self, ip):
-        """Hole Daten direkt von einem PlantBot-Gerät."""
+        """Legacy HTTP GET /status – nur noch als Fallback nutzbar."""
         # Verwende /status Endpoint mit GET (wie im Hardware-Code definiert)
         endpoint = f"http://{ip}/status"
         
@@ -643,45 +753,22 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                     continue
                 
                 # Topics für diese Station
-                logs_topic = f"plantbot/{ip}/logs"
-                ack_topic = f"plantbot/{ip}/ack"
-                update_topic = f"plantbot/{ip}/update"
-                
-                # Subscribe auf logs
-                if logs_topic not in self._subscribed_topics:
-                    try:
-                        await self._mqtt_subscribe_client.subscribe(logs_topic, qos=1)
-                        self._subscribed_topics.add(logs_topic)
-                        _LOGGER.info("Subscribed auf %s", logs_topic)
-                        subscribed_count += 1
-                    except Exception as e:
-                        _LOGGER.warning("Fehler beim Subscribe auf %s: %s", logs_topic, e)
-                else:
-                    _LOGGER.debug("Bereits subscribed auf %s", logs_topic)
-                
-                # Subscribe auf ack
-                if ack_topic not in self._subscribed_topics:
-                    try:
-                        await self._mqtt_subscribe_client.subscribe(ack_topic, qos=1)
-                        self._subscribed_topics.add(ack_topic)
-                        _LOGGER.info("Subscribed auf %s", ack_topic)
-                        subscribed_count += 1
-                    except Exception as e:
-                        _LOGGER.warning("Fehler beim Subscribe auf %s: %s", ack_topic, e)
-                else:
-                    _LOGGER.debug("Bereits subscribed auf %s", ack_topic)
+                topic_suffixes = ("logs", "ack", "update", "sensors", "status", "valves")
+                for suffix in topic_suffixes:
+                    topic = f"plantbot/{ip}/{suffix}"
+                    if topic not in self._subscribed_topics:
+                        try:
+                            await self._mqtt_subscribe_client.subscribe(topic, qos=1)
+                            self._subscribed_topics.add(topic)
+                            _LOGGER.info("Subscribed auf %s", topic)
+                            subscribed_count += 1
+                        except Exception as e:
+                            _LOGGER.warning("Fehler beim Subscribe auf %s: %s", topic, e)
+                    else:
+                        _LOGGER.debug("Bereits subscribed auf %s", topic)
 
-                # Subscribe auf update status (OTA)
-                if update_topic not in self._subscribed_topics:
-                    try:
-                        await self._mqtt_subscribe_client.subscribe(update_topic, qos=1)
-                        self._subscribed_topics.add(update_topic)
-                        _LOGGER.info("Subscribed auf %s", update_topic)
-                        subscribed_count += 1
-                    except Exception as e:
-                        _LOGGER.warning("Fehler beim Subscribe auf %s: %s", update_topic, e)
-                else:
-                    _LOGGER.debug("Bereits subscribed auf %s", update_topic)
+                # Snapshot anfordern (sensors + status + valves)
+                await self.request_status_snapshot(ip)
             
             _LOGGER.info("MQTT-Subscribe abgeschlossen: %d Topics abonniert", subscribed_count)
         except Exception as e:
@@ -699,7 +786,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 return
             
             ip = parts[1]
-            message_type = parts[2]  # "logs" | "ack" | "update"
+            message_type = parts[2]  # "logs" | "ack" | "update" | "sensors" | "status" | "valves"
             
             # Finde Station anhand IP
             station_id = None
@@ -714,17 +801,20 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 _LOGGER.warning("Keine Station gefunden für IP %s (Topic: %s)", ip, topic)
                 return
             
-            _LOGGER.info("MQTT-Nachricht empfangen: %s -> %s", topic, payload_str[:100])
+            _LOGGER.debug("MQTT-Nachricht empfangen: %s -> %s", topic, payload_str[:100])
             
             if message_type == "logs":
-                _LOGGER.debug("Verarbeite Log-Nachricht für Station %s", station_id)
                 await self._handle_log_message(station_id, station_data, data)
             elif message_type == "ack":
-                _LOGGER.debug("Verarbeite ACK-Nachricht für Station %s", station_id)
                 await self._handle_ack_message(station_id, station_data, data)
             elif message_type == "update":
-                _LOGGER.debug("Verarbeite Update-Status für Station %s", station_id)
                 await self._handle_update_message(station_id, station_data, data)
+            elif message_type == "sensors":
+                await self._handle_sensors_message(station_id, station_data, data)
+            elif message_type == "status":
+                await self._handle_status_message(station_id, station_data, data)
+            elif message_type == "valves":
+                await self._handle_valves_message(station_id, station_data, data)
             else:
                 _LOGGER.warning("Unbekannter MQTT-Message-Typ: %s (Topic: %s)", message_type, topic)
             
@@ -732,6 +822,72 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             _LOGGER.error("Fehler beim Parsen der MQTT-Nachricht von %s: %s", topic, e)
         except Exception as e:
             _LOGGER.error("Fehler beim Verarbeiten der MQTT-Nachricht von %s: %s", topic, e)
+
+    async def _handle_sensors_message(self, station_id, station_data, sensor_data):
+        """Sensordaten von plantbot/{ip}/sensors."""
+        try:
+            if not self.data or station_id not in self.data:
+                return
+            updated_data = self.data.copy()
+            station = updated_data[station_id].copy()
+            body = sensor_data.get("body") if isinstance(sensor_data, dict) else None
+            if isinstance(body, dict) and "Sensoren" in body:
+                station["Sensoren"] = body["Sensoren"]
+                if body.get("name"):
+                    # Nur setzen wenn kein Server-Name vorhanden
+                    if not station.get("server_name") and station.get("source") != "server":
+                        station["name"] = body["name"]
+            elif isinstance(sensor_data, dict) and "Sensoren" in sensor_data:
+                station["Sensoren"] = sensor_data["Sensoren"]
+            self._touch_mqtt_seen(station)
+            updated_data[station_id] = station
+            self.async_set_updated_data(updated_data)
+        except Exception as e:
+            _LOGGER.error("Fehler beim Verarbeiten der Sensors-Nachricht: %s", e)
+
+    async def _handle_status_message(self, station_id, station_data, status_data):
+        """Status von plantbot/{ip}/status."""
+        try:
+            if not self.data or station_id not in self.data:
+                return
+            updated_data = self.data.copy()
+            station = updated_data[station_id].copy()
+            if status_data.get("firmware_version") is not None:
+                station["current_version"] = status_data.get("firmware_version")
+            if status_data.get("wifi_rssi") is not None:
+                station["wifi"] = status_data.get("wifi_rssi")
+            if status_data.get("free_heap") is not None:
+                station["memory_usage"] = status_data.get("free_heap")
+            if status_data.get("uptime_seconds") is not None:
+                station["runtime"] = status_data.get("uptime_seconds")
+            if status_data.get("online") is False:
+                station["status"] = "offline"
+            elif station.get("watering_status") == "running":
+                station["status"] = "am Gießen"
+            else:
+                station["status"] = "bereit"
+            self._touch_mqtt_seen(station)
+            updated_data[station_id] = station
+            self.async_set_updated_data(updated_data)
+        except Exception as e:
+            _LOGGER.error("Fehler beim Verarbeiten der Status-Nachricht: %s", e)
+
+    async def _handle_valves_message(self, station_id, station_data, valves_data):
+        """Ventilzustände von plantbot/{ip}/valves."""
+        try:
+            if not self.data or station_id not in self.data:
+                return
+            updated_data = self.data.copy()
+            station = updated_data[station_id].copy()
+            valves = valves_data.get("valves") if isinstance(valves_data, dict) else None
+            if isinstance(valves, list):
+                station["valves"] = valves
+            self._touch_mqtt_seen(station)
+            updated_data[station_id] = station
+            self.async_set_updated_data(updated_data)
+            _LOGGER.debug("Station %s: %d Ventile via MQTT aktualisiert", station_id, len(valves or []))
+        except Exception as e:
+            _LOGGER.error("Fehler beim Verarbeiten der Valves-Nachricht: %s", e)
 
     async def _handle_log_message(self, station_id, station_data, log_data):
         """Verarbeite Log-Nachricht (Live-Updates während des Gießens)."""
@@ -805,6 +961,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 updated_data[station_id] = station
                 
                 # Aktualisiere Coordinator-Daten
+                self._touch_mqtt_seen(station)
                 self.async_set_updated_data(updated_data)
                 
                 _LOGGER.debug("Station %s aktualisiert mit Log-Daten: %s ml, %s s, Flow: %s", 
@@ -880,6 +1037,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 updated_data[station_id] = station
                 
                 # Aktualisiere Coordinator-Daten
+                self._touch_mqtt_seen(station)
                 self.async_set_updated_data(updated_data)
                 
                 _LOGGER.info("Station %s: Bewässerung %s - %s ml in %s s", 
@@ -906,6 +1064,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
 
             station = updated_data[station_id].copy()
             station["firmware_update"] = update_data
+            self._touch_mqtt_seen(station)
             updated_data[station_id] = station
             self.async_set_updated_data(updated_data)
 
