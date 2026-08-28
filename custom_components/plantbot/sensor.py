@@ -34,6 +34,11 @@ def _plantbot_value_is_valid(props, value):
             pass
     return True
 
+# Optional station metrics that should exist even before the first MQTT snapshot.
+ALWAYS_CREATE_STATION_SENSORS = frozenset(
+    {"flow", "lastVolume", "water_runtime", "jobs", "last_reset_reason"}
+)
+
 SENSOR_TYPES = {
     "temp": {"name": "Temperatur", "unit": UnitOfTemperature.CELSIUS, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, 'valid_range': (-30.0, 60.0)},
     "hum": {"name": "Feuchtigkeit", "unit": PERCENTAGE, "device_class": SensorDeviceClass.HUMIDITY, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, 'valid_range': (0.0, 100.0)},
@@ -84,8 +89,16 @@ async def async_setup_entry(hass, entry, async_add_entities):
         # 1. Feste Sensoren
         for key, props in SENSOR_TYPES.items():
             value = station.get(key)
-            if not props["optional"] or key in station:
-                if props.get('optional', False) and not _plantbot_value_is_valid(props, value):
+            if (
+                not props["optional"]
+                or key in station
+                or key in ALWAYS_CREATE_STATION_SENSORS
+            ):
+                if (
+                    props.get("optional", False)
+                    and key not in ALWAYS_CREATE_STATION_SENSORS
+                    and not _plantbot_value_is_valid(props, value)
+                ):
                     continue
                 entities.append(PlantbotHASensor(coordinator, station_id, key, props, station_name))
 

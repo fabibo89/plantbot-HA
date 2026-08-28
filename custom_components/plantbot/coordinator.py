@@ -2,7 +2,7 @@ import logging
 from datetime import timedelta
 import aiohttp
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from .const import DOMAIN
+from .const import DOMAIN, EVENT_WATERING_FINISHED
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import asyncio
 import json
@@ -28,6 +28,7 @@ LIVE_MQTT_FIELDS = (
     "flow",
     "lastVolume",
     "water_runtime",
+    "last_reset_reason",
     "runtime",
     "memory_usage",
     "current_version",
@@ -579,6 +580,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             "flow",
             "lastVolume",
             "water_runtime",
+            "last_reset_reason",
             "runtime",
             "memory_usage",
             "current_version",
@@ -976,9 +978,19 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 station["memory_usage"] = status_data.get("free_heap")
             if status_data.get("uptime_seconds") is not None:
                 station["runtime"] = status_data.get("uptime_seconds")
+            if status_data.get("flow") is not None:
+                station["flow"] = status_data.get("flow")
+            if status_data.get("last_volume_ml") is not None:
+                station["lastVolume"] = status_data.get("last_volume_ml")
+            elif status_data.get("lastVolume") is not None:
+                station["lastVolume"] = status_data.get("lastVolume")
+            if status_data.get("water_runtime") is not None:
+                station["water_runtime"] = status_data.get("water_runtime")
+            if status_data.get("last_reset_reason") is not None:
+                station["last_reset_reason"] = status_data.get("last_reset_reason")
             if status_data.get("online") is False:
                 station["status"] = "offline"
-            elif station.get("watering_status") == "running":
+            elif status_data.get("watering") or station.get("watering_status") == "running":
                 station["status"] = "am Gießen"
             else:
                 station["status"] = "bereit"
@@ -1088,6 +1100,71 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         except Exception as e:
             _LOGGER.error("Fehler beim Verarbeiten der Log-Nachricht: %s", e)
 
+    def _resolve_watering_context(self, station: dict, ack_data: dict) -> tuple[str | None, int | None, int | None]:
+        """Resolve plant name and pump/valve from ACK (with last_log / plant_mapping fallbacks)."""
+        pump_number = ack_data.get("pump_number")
+        valve_number = ack_data.get("valve_number")
+
+        if pump_number is None or valve_number is None:
+            last_log = station.get("last_log") or {}
+            if last_log.get("job_id") == ack_data.get("job_id"):
+                pump_number = pump_number if pump_number is not None else last_log.get("pump_number")
+                valve_number = valve_number if valve_number is not None else last_log.get("valve_number")
+
+        plant_name = ack_data.get("plant_name")
+        if not plant_name and pump_number is not None and valve_number is not None:
+            plant_mapping = station.get("plant_mapping") or {}
+            try:
+                plant_name = plant_mapping.get((int(pump_number), int(valve_number)))
+            except (TypeError, ValueError):
+                plant_name = None
+
+        return plant_name, pump_number, valve_number
+
+    def _fire_watering_finished_event(self, station_id: str, station: dict, ack_data: dict) -> None:
+        """Fire homeassistant event when a server watering job finishes (ACK with job_id > 0)."""
+        if self.connection_type != "server":
+            return
+
+        job_id = ack_data.get("job_id")
+        try:
+            if job_id is None or int(job_id) <= 0:
+                return
+        except (TypeError, ValueError):
+            return
+
+        status = ack_data.get("status", "unknown")
+        if status not in ("completed", "failed", "cancelled"):
+            return
+
+        plant_name, pump_number, valve_number = self._resolve_watering_context(station, ack_data)
+        event_data = {
+            "station_id": station_id,
+            "station_name": station.get("name"),
+            "job_id": int(job_id),
+            "status": status,
+            "plant_name": plant_name,
+            "pump_number": pump_number,
+            "valve_number": valve_number,
+            "amount_ml": ack_data.get("actual_amount_ml"),
+            "duration_seconds": ack_data.get("actual_duration_seconds"),
+        }
+        if ack_data.get("error"):
+            event_data["error"] = ack_data["error"]
+        fertilizer = ack_data.get("fertilizer")
+        if isinstance(fertilizer, dict):
+            event_data["fertilizer"] = fertilizer
+
+        self.hass.bus.async_fire(EVENT_WATERING_FINISHED, event_data)
+        _LOGGER.info(
+            "Event %s: station=%s plant=%s status=%s job_id=%s",
+            EVENT_WATERING_FINISHED,
+            station.get("name"),
+            plant_name,
+            status,
+            job_id,
+        )
+
     async def _handle_ack_message(self, station_id, station_data, ack_data):
         """Verarbeite ACK-Nachricht (Bewässerung beendet)."""
         try:
@@ -1155,8 +1232,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 # Aktualisiere Coordinator-Daten
                 self._touch_mqtt_seen(station)
                 self.async_set_updated_data(updated_data)
+                self._fire_watering_finished_event(station_id, station, ack_data)
                 
-                _LOGGER.info("Station %s: Bewässerung %s - %s ml in %s s", 
+                _LOGGER.info("Station %s: Bewässerung %s - %s ml in %s s",
                             station_id,
                             status,
                             ack_data.get("actual_amount_ml", 0),
