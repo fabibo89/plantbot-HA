@@ -19,6 +19,82 @@ MQTT_STALE_SECONDS = 120
 # Gelegentlicher Snapshot-Request statt HTTP-Polling
 MQTT_STATUS_REQUEST_INTERVAL = 300
 
+# Felder, die per MQTT live aktualisiert werden und beim Server-Refresh erhalten bleiben müssen
+LIVE_MQTT_FIELDS = (
+    "Sensoren",
+    "valves",
+    "status",
+    "wifi",
+    "flow",
+    "lastVolume",
+    "water_runtime",
+    "runtime",
+    "memory_usage",
+    "current_version",
+    "update_needed",
+    "last_mqtt_seen",
+    "firmware_update",
+    "watering_status",
+    "last_log",
+    "last_ack",
+    "current_watering_volume",
+    "current_watering_duration",
+)
+
+# Server-Entity-Key → MQTT-Key (PlantBot JSON)
+ENTITY_KEY_TO_MQTT = {
+    "temperature": "temp",
+    "humidity": "hum",
+    "pressure": "pres",
+    "conductivity": "cond",
+    "soil_moisture": "hum",
+    "light": "light",
+    "battery": "bat",
+    "water_level": "water_level",
+    "water_surface_cm": "water_surface_cm",
+}
+
+
+def _mqtt_entity_key(key: str | None) -> str | None:
+    if not key:
+        return None
+    return ENTITY_KEY_TO_MQTT.get(key, key)
+
+
+def _sensoren_from_server_devices(devices: list) -> dict:
+    """Baue PlantBot-Sensoren-JSON aus Server last_value (Fallback wenn MQTT leer)."""
+    sensoren: dict = {
+        "PlantBot": {},
+        "modbusSens": {},
+        "BTSensoren": {},
+        "analogSensoren": [],
+    }
+    for device in devices or []:
+        template = device.get("device_template") or {}
+        plantbot_key = template.get("plantbot_key")
+        if not plantbot_key:
+            continue
+        identifier = device.get("identifier") or str(device.get("id"))
+        for entity in device.get("entities") or []:
+            if entity.get("last_value") is None:
+                continue
+            entity_tpl = entity.get("entity_template") or {}
+            raw_key = entity_tpl.get("key")
+            mqtt_key = _mqtt_entity_key(raw_key)
+            if not mqtt_key:
+                continue
+            value = entity["last_value"]
+            if plantbot_key == "PlantBot":
+                sensoren["PlantBot"][mqtt_key] = value
+            elif plantbot_key in ("modbusSens", "BTSensoren"):
+                bucket = sensoren.setdefault(plantbot_key, {})
+                addr = str(identifier)
+                if addr not in bucket:
+                    bucket[addr] = {}
+                bucket[addr][mqtt_key] = value
+    return sensoren
+
+
 class PlantbotHACoordinator(DataUpdateCoordinator):
     def __init__(self, hass, config_data, entry_id=None):
         self.hass = hass
@@ -52,6 +128,44 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             update_interval=timedelta(seconds=60),
         )
 
+        if self.mqtt_broker:
+            hass.async_create_task(self._ensure_mqtt_subscribe())
+
+    def _merge_live_station_fields(self, target: dict, source: dict | None) -> None:
+        """MQTT-Livefelder aus source in target übernehmen (source gewinnt wenn gesetzt)."""
+        if not source:
+            return
+        for field in LIVE_MQTT_FIELDS:
+            if field not in source:
+                continue
+            value = source[field]
+            if field == "Sensoren" and isinstance(value, dict):
+                if value.get("PlantBot") or value.get("modbusSens") or value.get("BTSensoren"):
+                    target[field] = value
+            elif value is not None:
+                target[field] = value
+
+    def _merge_all_live_data(self, result: dict) -> dict:
+        """Nach Server-Fetch aktuelle MQTT-Daten wieder einmergen (Race-Schutz)."""
+        if not isinstance(result, dict) or not isinstance(self.data, dict):
+            return result
+        merged = {}
+        for key, station in result.items():
+            merged_station = station.copy()
+            self._merge_live_station_fields(merged_station, self.data.get(key))
+            merged[key] = merged_station
+        # Stationen, die nur via MQTT existieren, behalten
+        for key, station in self.data.items():
+            if key not in merged:
+                merged[key] = station.copy()
+        return merged
+
+    async def _ensure_mqtt_subscribe(self):
+        if not self.mqtt_broker or self._mqtt_subscribe_task:
+            return
+        _LOGGER.info("Starte MQTT-Subscribe-Task (Broker: %s:%s)", self.mqtt_broker, self.mqtt_port)
+        self._mqtt_subscribe_task = self.hass.async_create_task(self._start_mqtt_subscribe())
+
     async def _async_update_data(self):
         """Fetch data from PlantBot(s)."""
         _LOGGER.info("_async_update_data aufgerufen, connection_type: %s", self.connection_type)
@@ -80,19 +194,17 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
 
             self._refresh_mqtt_availability(result)
 
+            # MQTT-Updates, die während des Server-Fetches kamen, nicht überschreiben
+            result = self._merge_all_live_data(result)
+
             # Gelegentlich Snapshot per MQTT anfordern (statt HTTP /status)
             if result and self.mqtt_broker:
                 now = time.time()
                 if now - self._last_status_request >= MQTT_STATUS_REQUEST_INTERVAL:
                     self._last_status_request = now
                     self.hass.async_create_task(self._request_status_all(result))
-            
-            # Starte MQTT-Subscribe nach erstem erfolgreichen Update
-            # Verwende result oder vorhandene Daten (falls result leer ist wegen Timeouts)
-            data_for_subscribe = result if result else (self.data if self.data else {})
-            if data_for_subscribe and self.mqtt_broker and not self._mqtt_subscribe_task:
-                _LOGGER.info("Starte MQTT-Subscribe für %d Stationen", len(data_for_subscribe))
-                self._mqtt_subscribe_task = self.hass.async_create_task(self._start_mqtt_subscribe())
+
+            await self._ensure_mqtt_subscribe()
             
             return result
         except asyncio.CancelledError:
@@ -265,6 +377,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 # Hole Pflanzen für diese Station
                 plant_mapping = {}
                 sensor_mapping = {}  # identifier -> plant_name
+                server_sensoren = {}
                 jobs_count = 0  # Anzahl pending Jobs
                 _LOGGER.debug("Hole Pflanzen für Station ID: %s (Typ: %s), Name: %s, IP: %s", 
                              station_id, type(station_id).__name__, station_name, ip)
@@ -318,6 +431,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                                 if response.status == 200:
                                     sensor_devices = await response.json()
                                     _LOGGER.debug("Sensor-Devices für Station %s erhalten: %d Devices", station_id, len(sensor_devices))
+                                    server_sensoren = _sensoren_from_server_devices(sensor_devices)
                                     for device in sensor_devices:
                                         identifier = device.get("identifier")
                                         plant = device.get("plant")
@@ -333,6 +447,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                                     async with self.session.get(sensors_endpoint, headers=headers, ssl=False, timeout=10) as retry_response:
                                         if retry_response.status == 200:
                                             sensor_devices = await retry_response.json()
+                                            server_sensoren = _sensoren_from_server_devices(sensor_devices)
                                             for device in sensor_devices:
                                                 identifier = device.get("identifier")
                                                 plant = device.get("plant")
@@ -398,28 +513,24 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                         "jobs": jobs_count,
                     }
                     # Live-Daten aus MQTT behalten
-                    for field in (
-                        "Sensoren",
-                        "valves",
-                        "status",
-                        "wifi",
-                        "flow",
-                        "lastVolume",
-                        "water_runtime",
-                        "runtime",
-                        "memory_usage",
-                        "current_version",
-                        "update_needed",
-                        "last_mqtt_seen",
-                        "firmware_update",
-                        "watering_status",
-                        "last_log",
-                        "last_ack",
-                        "current_watering_volume",
-                        "current_watering_duration",
-                    ):
+                    for field in LIVE_MQTT_FIELDS:
                         if field in existing:
                             station_entry[field] = existing[field]
+                    # Fallback: Sensoren vom Server (last_value), wenn MQTT noch leer
+                    existing_sensoren = station_entry.get("Sensoren") or {}
+                    has_live_sensoren = bool(
+                        (existing_sensoren.get("PlantBot") or existing_sensoren.get("modbusSens") or existing_sensoren.get("BTSensoren"))
+                    )
+                    if not has_live_sensoren and server_sensoren and (
+                        server_sensoren.get("PlantBot")
+                        or server_sensoren.get("modbusSens")
+                        or server_sensoren.get("BTSensoren")
+                    ):
+                        station_entry["Sensoren"] = server_sensoren
+                        _LOGGER.debug(
+                            "Station %s: Sensoren aus Server last_value übernommen (MQTT-Fallback)",
+                            station_id,
+                        )
                     result[result_key] = station_entry
                 except Exception as e:
                     _LOGGER.warning("Fehler beim Aufbauen der Station %s (%s): %s", station_name, ip, e)
@@ -842,6 +953,11 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             self._touch_mqtt_seen(station)
             updated_data[station_id] = station
             self.async_set_updated_data(updated_data)
+            _LOGGER.debug(
+                "Station %s: Sensoren via MQTT aktualisiert (PlantBot keys: %s)",
+                station_id,
+                list((station.get("Sensoren") or {}).get("PlantBot", {}).keys()),
+            )
         except Exception as e:
             _LOGGER.error("Fehler beim Verarbeiten der Sensors-Nachricht: %s", e)
 
