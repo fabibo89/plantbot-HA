@@ -36,7 +36,7 @@ def _plantbot_value_is_valid(props, value):
 
 # Optional station metrics that should exist even before the first MQTT snapshot.
 ALWAYS_CREATE_STATION_SENSORS = frozenset(
-    {"flow", "lastVolume", "water_runtime", "jobs", "last_reset_reason"}
+    {"flow", "lastVolume", "water_runtime", "jobs", "last_reset_reason", "update_needed"}
 )
 
 SENSOR_TYPES = {

@@ -32,6 +32,7 @@ LIVE_MQTT_FIELDS = (
     "runtime",
     "memory_usage",
     "current_version",
+    "latest_version",
     "update_needed",
     "last_mqtt_seen",
     "firmware_update",
@@ -584,6 +585,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             "runtime",
             "memory_usage",
             "current_version",
+            "latest_version",
             "update_needed",
             "last_mqtt_seen",
             "firmware_update",
@@ -972,6 +974,11 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             station = updated_data[station_id].copy()
             if status_data.get("firmware_version") is not None:
                 station["current_version"] = status_data.get("firmware_version")
+            if status_data.get("latest_version") is not None:
+                station["latest_version"] = status_data.get("latest_version")
+            if status_data.get("update_needed") is not None:
+                # Firmware sends 0/1; keep truthy for HA update entity
+                station["update_needed"] = bool(status_data.get("update_needed"))
             if status_data.get("wifi_rssi") is not None:
                 station["wifi"] = status_data.get("wifi_rssi")
             if status_data.get("free_heap") is not None:
