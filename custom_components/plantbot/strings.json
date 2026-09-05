@@ -67,6 +67,18 @@
         }
       }
     }
+  },
+  "device_automation": {
+    "trigger_type": {
+      "watering_finished": "Gießen beendet",
+      "watering_completed": "Gießen erfolgreich beendet",
+      "watering_failed": "Gießen fehlgeschlagen",
+      "watering_cancelled": "Gießen abgebrochen",
+      "alert_active": "Alert aktiv",
+      "alert_cleared": "Alert aufgehoben",
+      "water_level_low": "Wasserstand niedrig",
+      "water_level_low_cleared": "Wasserstand wieder OK"
+    }
   }
 }
 

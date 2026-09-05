@@ -1,7 +1,8 @@
 import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from .const import DOMAIN
+from homeassistant.helpers import device_registry as dr
+from .const import DOMAIN, station_device_identifiers
 from .coordinator import PlantbotHACoordinator
 from .valve import ENTITIES
 
@@ -9,6 +10,44 @@ import asyncio
 
 PLATFORMS = ["valve", "sensor", "update", "button"]
 _LOGGER = logging.getLogger(__name__)
+
+
+def _async_register_station_devices(
+    hass: HomeAssistant, entry: ConfigEntry, coordinator: PlantbotHACoordinator
+) -> None:
+    """Geräte explizit an Config-Entry hängen – sonst lädt HA kein plantbot.device_trigger."""
+    registry = dr.async_get(hass)
+    stations = coordinator.data or {}
+    if not stations:
+        _LOGGER.warning(
+            "Keine Stationen für Device-Registrierung (Entry %s) – "
+            "Device-Trigger erscheinen ggf. erst nach Reload",
+            entry.entry_id,
+        )
+        return
+
+    for station_id, station in stations.items():
+        if not isinstance(station, dict):
+            continue
+        identifiers = station_device_identifiers(station_id)
+        kwargs = {
+            "config_entry_id": entry.entry_id,
+            "identifiers": identifiers,
+            "manufacturer": "PlantBot",
+            "model": "Bewässerungsstation",
+            "name": station.get("name") or f"Station {station_id}",
+        }
+        ip = station.get("ip")
+        if ip:
+            kwargs["configuration_url"] = f"http://{ip}"
+        device = registry.async_get_or_create(**kwargs)
+        _LOGGER.info(
+            "PlantBot-Gerät registriert: name=%s id=%s identifiers=%s config_entries=%s",
+            device.name,
+            device.id,
+            identifiers,
+            list(device.config_entries),
+        )
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     """Set up PlantBot HA from a config entry."""
@@ -93,6 +132,20 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
         else:
             _LOGGER.warning("Keine Platforms zum Laden verfügbar")
         _LOGGER.debug("Platforms geladen")
+
+        # Nach Platforms: Geräte an Config-Entry binden (für Device-Trigger)
+        _async_register_station_devices(hass, entry, coordinator)
+
+        # device_trigger lazy-loadet HA sonst still – Importfehler hier sichtbar machen
+        try:
+            from . import device_trigger as _device_trigger  # noqa: F401
+
+            _LOGGER.info("device_trigger-Modul Import OK")
+        except Exception:
+            _LOGGER.exception(
+                "device_trigger-Modul Import FEHLGESCHLAGEN – "
+                "Automation-Geräte-Trigger erscheinen nicht"
+            )
 
         # Registriere Services für Ventilsteuerung
         # Die services.yaml wird automatisch von Home Assistant geladen

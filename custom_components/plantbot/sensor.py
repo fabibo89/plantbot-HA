@@ -7,7 +7,7 @@ from homeassistant.const import UnitOfPressure
 
 _LOGGER = logging.getLogger(__name__)
 
-from .const import DOMAIN
+from .const import DOMAIN, station_device_identifiers
 
 # --- PlantBot minimal validator ---
 def _plantbot_value_is_valid(props, value):
@@ -36,8 +36,21 @@ def _plantbot_value_is_valid(props, value):
 
 # Optional station metrics that should exist even before the first MQTT snapshot.
 ALWAYS_CREATE_STATION_SENSORS = frozenset(
-    {"flow", "lastVolume", "water_runtime", "jobs", "last_reset_reason", "update_needed"}
+    {
+        "flow",
+        "lastVolume",
+        "water_runtime",
+        "watering_percent",
+        "watering_remaining_ml",
+        "watering_remaining_seconds",
+        "alert_status",
+        "jobs",
+        "last_reset_reason",
+    }
 )
+
+# Nur im Server-Modus sinnvoll (Queue, Pflanzen-API, …)
+SERVER_ONLY_STATION_SENSORS = frozenset({"jobs"})
 
 SENSOR_TYPES = {
     "temp": {"name": "Temperatur", "unit": UnitOfTemperature.CELSIUS, "device_class": SensorDeviceClass.TEMPERATURE, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "ignore_zero": True, 'valid_range': (-30.0, 60.0)},
@@ -48,6 +61,10 @@ SENSOR_TYPES = {
     "jobs": {"name": "Jobs", "unit": "count", "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:playlist-play", "ignore_zero": False},
     "flow": {"name": "Flow", "unit": None, "device_class": None, "state_class": SensorStateClass.TOTAL, "optional": True, "icon": "mdi:water-pump"},
     "lastVolume": {"name": "Volume", "unit": 'ml', "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:water"},
+    "watering_percent": {"name": "Gießfortschritt", "unit": PERCENTAGE, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:water-percent", "ignore_zero": False, "valid_range": (0.0, 100.0)},
+    "watering_remaining_ml": {"name": "Restvolumen", "unit": "ml", "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:cup-water", "ignore_zero": False},
+    "watering_remaining_seconds": {"name": "Restzeit", "unit": "s", "device_class": SensorDeviceClass.DURATION, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:timer-outline", "ignore_zero": False},
+    "alert_status": {"name": "Alert-Status", "unit": None, "device_class": None, "optional": True, "icon": "mdi:alert-circle-outline", "ignore_zero": False},
     "status": {"name": "Status", "unit": None, "device_class": None, "optional": False, "icon": "mdi:information"},
     "wifi": {"name": "WIFI", "unit": SIGNAL_STRENGTH_DECIBELS_MILLIWATT, "device_class": SensorDeviceClass.SIGNAL_STRENGTH, "state_class": SensorStateClass.MEASUREMENT, "optional": False, 'valid_range': (-100.0, -20.0)},
     "runtime": {"name": "Runtime", "unit": "min", "device_class": SensorDeviceClass.DURATION, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "convert_from_seconds": True},
@@ -55,7 +72,6 @@ SENSOR_TYPES = {
     "last_reset_reason": {"name": "Letzter Reset Grund", "unit": None, "device_class": None, "optional": True, "icon": "mdi:restart"},
     "memory_usage": {"name": "Speicherauslastung", "unit": None, "device_class": None, "state_class": SensorStateClass.MEASUREMENT, "optional": True, "icon": "mdi:memory"},
     "current_version": {"name": "Firmware Version", "unit": None, "device_class": None, "optional": True, "icon": "mdi:information"},
-    "update_needed": {"name": "Update erforderlich", "unit": None, "device_class": None, "optional": True, "icon": "mdi:update"},
 }
 
 DYNAMIC_SENSOR_TYPES = {
@@ -85,9 +101,12 @@ async def async_setup_entry(hass, entry, async_add_entities):
 
     for station_id, station in coordinator.data.items():
         station_name = station.get("name", f"Station {station_id}")
+        is_server = coordinator.connection_type == "server"
         
         # 1. Feste Sensoren
         for key, props in SENSOR_TYPES.items():
+            if key in SERVER_ONLY_STATION_SENSORS and not is_server:
+                continue
             value = station.get(key)
             if (
                 not props["optional"]
@@ -196,62 +215,23 @@ class PlantbotHASensor(SensorEntity):
         self._attr_icon = props.get("icon")
         self._props = props
         
-        # Bestimme Sensor-Namen basierend auf Pflanze (falls vorhanden)
-        base_name = props['name']
-        
-        # Coordinator speichert Keys als "station_{id}", also müssen wir das prüfen
-        station_key = self.station_id if self.station_id.startswith("station_") else f"station_{self.station_id}"
-        station_data = coordinator.data.get(station_key, {})
-        plant_mapping = station_data.get("plant_mapping", {})
-        sensor_mapping = station_data.get("sensor_mapping", {})
-        
-        # Prüfe ob der Name bereits einen Pflanzennamen enthält
-        # (wurde bereits in dynamischer Sensor-Erstellung gesetzt)
-        # Prüfe ob der letzte Teil des Namens ein Pflanzennamen ist
-        name_parts = base_name.split()
-        if len(name_parts) > 1:
-            last_part = name_parts[-1]
-            # Prüfe ob der letzte Teil ein Pflanzennamen ist (entweder in plant_mapping oder sensor_mapping)
-            is_plant_name = (
-                last_part in plant_mapping.values() or 
-                last_part in sensor_mapping.values()
-            )
-            if is_plant_name:
-                # Name enthält bereits einen Pflanzennamen (z.B. "Bodenfeuchtigkeit Gurke")
-                # Verwende ihn direkt, ohne weitere Anpassung
-                self._attr_name = base_name
-                _LOGGER.debug("Sensor-Name bereits mit Pflanze: %s -> %s", self.key, self._attr_name)
-            else:
-                # Name enthält noch keinen Pflanzennamen, prüfe ob wir einen hinzufügen müssen
-                _LOGGER.debug("Sensor %s: station_id=%s, plant_mapping=%s, len=%d", 
-                             self.key, self.station_id, plant_mapping, len(plant_mapping) if plant_mapping else 0)
-                
-                # Für normale Sensoren (nicht dynamische): Wenn genau eine Pflanze vorhanden, verwende sie
-                # Format: "Sensor-Name Pflanze" (z.B. "Temperatur Tomate")
-                if plant_mapping and len(plant_mapping) == 1:
-                    plant_name = list(plant_mapping.values())[0]
-                    self._attr_name = f"{base_name} {plant_name}"
-                    _LOGGER.debug("Sensor umbenannt: %s -> %s (von %d Pflanzen)", self.key, self._attr_name, len(plant_mapping))
-                else:
-                    # Keine Pflanze oder mehrere Pflanzen: Standard-Name
-                    self._attr_name = base_name
-                    _LOGGER.debug("Sensor ohne Pflanze: %s -> %s", self.key, self._attr_name)
-        else:
-            # Name hat nur einen Teil, prüfe ob wir eine Pflanze hinzufügen müssen
-            _LOGGER.debug("Sensor %s: station_id=%s, plant_mapping=%s, len=%d", 
-                         self.key, self.station_id, plant_mapping, len(plant_mapping) if plant_mapping else 0)
-            
-            # Für normale Sensoren (nicht dynamische): Wenn genau eine Pflanze vorhanden, verwende sie
-            if plant_mapping and len(plant_mapping) == 1:
-                plant_name = list(plant_mapping.values())[0]
-                self._attr_name = f"{base_name} {plant_name}"
-                _LOGGER.debug("Sensor umbenannt: %s -> %s (von %d Pflanzen)", self.key, self._attr_name, len(plant_mapping))
-            else:
-                # Keine Pflanze oder mehrere Pflanzen: Standard-Name
-                self._attr_name = base_name
-                _LOGGER.debug("Sensor ohne Pflanze: %s -> %s", self.key, self._attr_name)
+        # Bestimme Sensor-Namen
+        # Pflanzenname nur bei dynamischen Sensoren (bereits in async_setup_entry gesetzt).
+        # Stations-Metriken (Flow, WIFI, Status, …) bekommen keinen Pflanzen-Suffix.
+        self._attr_name = props["name"]
         
         self._attr_unique_id = f"{DOMAIN}_{station_id}_{key}"
+
+    @property
+    def extra_state_attributes(self):
+        if self.key != "alert_status":
+            return None
+        station_key = self.station_id if self.station_id.startswith("station_") else f"station_{self.station_id}"
+        station_data = (self.coordinator.data or {}).get(station_key, {})
+        return {
+            "alerts": station_data.get("alerts") or {},
+            "last_alert": station_data.get("last_alert"),
+        }
 
     @property
     def native_value(self):
@@ -301,6 +281,9 @@ class PlantbotHASensor(SensorEntity):
         elif value is None:
             value = station_data.get(self.key)
 
+        if self.key == "alert_status" and (value is None or value == ""):
+            return "ok"
+
         # Validierung
         if not _plantbot_value_is_valid(self._props, value):
             return None
@@ -332,7 +315,7 @@ class PlantbotHASensor(SensorEntity):
     @property
     def device_info(self):
         info = {
-            "identifiers": {(DOMAIN, f"station_{self.station_id}")},
+            "identifiers": station_device_identifiers(self.station_id),
             "name": self.station_name,
             "manufacturer": "PlantBot",
             "model": "Bewässerungsstation",

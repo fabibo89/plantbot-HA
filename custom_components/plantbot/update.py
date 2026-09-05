@@ -6,7 +6,7 @@ import time
 from typing import Optional
 import re
 
-from .const import DOMAIN
+from .const import DOMAIN, station_device_identifiers
 import logging
 
 _LOGGER = logging.getLogger(__name__)
@@ -16,6 +16,9 @@ UPDATE_STATUS_TIMEOUT = 300  # 5 Minuten max für Update
 UPDATE_STATUS_INTERVAL = 2  # Status alle 2 Sekunden abfragen
 UPDATE_START_RETRIES = 3  # 3 Versuche Update zu starten
 UPDATE_START_RETRY_DELAY = 2  # 2 Sekunden zwischen Versuchen
+# Nach OTA/Reboot: länger warten, statt UI auf "Aktualisieren" zurückzusetzen
+UPDATE_REBOOT_WAIT_SECONDS = 180  # max. Offline-/Reboot-Wartezeit nach OTA-Aktivität
+UPDATE_REBOOT_PROGRESS_HOLD = 95  # Fortschritt einfrieren während Reboot
 
 # GitHub Releases (for release notes shown in UI)
 GITHUB_OWNER = "fabibo89"
@@ -88,7 +91,7 @@ class PlantbotFirmwareUpdate(UpdateEntity):
         self._release_notes_task_tag: str | None = None
 
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"station_{self.station_id}")},
+            identifiers=station_device_identifiers(self.station_id),
             name=self.station_name,
             manufacturer="PlantBot",
             model="Bewässerungsstation",
@@ -185,6 +188,10 @@ class PlantbotFirmwareUpdate(UpdateEntity):
 
     @property
     def available(self):
+        # Während OTA/Reboot Entity verfügbar halten, sonst springt die HA-UI
+        # zurück auf "Aktualisieren", sobald die Station kurz offline ist.
+        if self._in_progress:
+            return True
         if not self.coordinator.data or self.station_id not in self.coordinator.data:
             return False
         station_data = self.coordinator.data[self.station_id]
@@ -270,6 +277,7 @@ class PlantbotFirmwareUpdate(UpdateEntity):
             return
         
         self._in_progress = True
+        self._attr_in_progress = True
         self._progress = 0
         self._update_start_time = time.time()
         self._consecutive_errors = 0
@@ -291,8 +299,7 @@ class PlantbotFirmwareUpdate(UpdateEntity):
         
         if not update_started:
             _LOGGER.error("Update konnte nicht gestartet werden nach %d Versuchen", UPDATE_START_RETRIES)
-            self._in_progress = False
-            self.async_write_ha_state()
+            self._set_in_progress(False)
             return
         
         # Warte kurz und prüfe ob Update wirklich gestartet wurde
@@ -308,27 +315,35 @@ class PlantbotFirmwareUpdate(UpdateEntity):
             status = self._update_data.get("status", "").lower()
             if status not in ["installing", "started", "downloading"]:
                 _LOGGER.error("Update scheint nicht gestartet zu sein (Status: %s)", status)
-                self._in_progress = False
-                self.async_write_ha_state()
+                self._set_in_progress(False)
                 return
         
-        # Überwache Update-Status
+        # Überwache Update-Status (inkl. Reboot – async_install blockiert bis dahin)
         await self._monitor_update_progress()
         
-        self._in_progress = False
-        self.async_write_ha_state()
+        self._set_in_progress(False)
         _LOGGER.info("Update-Prozess beendet für %s", self.station_name)
 
+    def _set_in_progress(self, value: bool) -> None:
+        """in_progress für Property und _attr_ synchron halten (HA-Frontend)."""
+        self._in_progress = value
+        self._attr_in_progress = value
+        self.async_write_ha_state()
+
     async def _check_device_reachable(self) -> bool:
-        """Prüfe ob das Gerät erreichbar ist."""
+        """Prüfe Erreichbarkeit über MQTT-Availability (kein HTTP /status)."""
+        station = (self.coordinator.data or {}).get(self.station_id) or {}
+        if station.get("available", False):
+            return True
+        if not self._station_ip:
+            return False
         try:
-            url = f"http://{self._station_ip}/status"
-            timeout = aiohttp.ClientTimeout(total=5, connect=3)
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    return resp.status == 200
+            await self.coordinator.request_status_snapshot(self._station_ip)
+            await asyncio.sleep(2)
+            station = (self.coordinator.data or {}).get(self.station_id) or {}
+            return bool(station.get("available", False))
         except Exception as e:
-            _LOGGER.debug("Gerät nicht erreichbar: %s", e)
+            _LOGGER.debug("Gerät per MQTT nicht erreichbar: %s", e)
             return False
 
     async def _fetch_release_notes(self) -> None:
@@ -498,18 +513,42 @@ class PlantbotFirmwareUpdate(UpdateEntity):
             _LOGGER.error("Fehler beim Starten des Updates: %s", e)
             return False
 
+    def _hold_reboot_progress(self) -> None:
+        """UI während Reboot/Offline bei installierend halten (kein Sprung zurück)."""
+        try:
+            current = int(self._update_data.get("progress", self._progress or 0) or 0)
+        except (TypeError, ValueError):
+            current = int(self._progress or 0)
+        hold = max(current, UPDATE_REBOOT_PROGRESS_HOLD)
+        if hold >= 100:
+            hold = UPDATE_REBOOT_PROGRESS_HOLD
+        self._progress = hold
+        self._update_data = {
+            **(self._update_data or {}),
+            "status": "rebooting",
+            "progress": hold,
+        }
+        self.async_write_ha_state()
+
     async def _monitor_update_progress(self):
         """Überwache Update-Fortschritt mit robustem Error-Handling."""
         max_duration = UPDATE_STATUS_TIMEOUT
         check_interval = UPDATE_STATUS_INTERVAL
         last_successful_check = time.time()
-        
+        offline_since: float | None = None
+        saw_ota_activity = False
+        saw_offline = False
+        target_version = self.latest_version
+
         while True:
             elapsed = time.time() - self._update_start_time
             
-            # Timeout prüfen
-            if elapsed > max_duration:
-                _LOGGER.error("Update-Timeout nach %d Sekunden", max_duration)
+            # Timeout prüfen (nach OTA etwas mehr Spielraum für Reboot)
+            effective_timeout = max_duration
+            if saw_ota_activity or saw_offline:
+                effective_timeout = max(max_duration, UPDATE_REBOOT_WAIT_SECONDS + 60)
+            if elapsed > effective_timeout:
+                _LOGGER.error("Update-Timeout nach %d Sekunden", int(elapsed))
                 break
             
             try:
@@ -519,51 +558,182 @@ class PlantbotFirmwareUpdate(UpdateEntity):
                 
                 progress = self._update_data.get("progress", 0)
                 status = self._update_data.get("status", "").lower()
-                
-                self._progress = progress
-                self.async_write_ha_state()
+                try:
+                    progress_int = int(progress or 0)
+                except (TypeError, ValueError):
+                    progress_int = 0
+
+                if status in ("installing", "started", "downloading", "rebooting") or progress_int > 0:
+                    saw_ota_activity = True
+
+                station = (self.coordinator.data or {}).get(self.station_id) or {}
+                station_online = bool(station.get("available", True))
+                if not station_online:
+                    saw_offline = True
+                    if offline_since is None:
+                        offline_since = time.time()
+                    # Reboot-Lücke: Progress einfrieren, in_progress bleibt aktiv
+                    self._hold_reboot_progress()
+                else:
+                    was_offline = offline_since is not None or saw_offline
+                    offline_since = None
+                    # Nach Reboot oft kein / leerer MQTT-Update-Status → Progress nicht auf 0 zurücksetzen
+                    if was_offline and (
+                        progress_int < UPDATE_REBOOT_PROGRESS_HOLD
+                        or status in ("", "idle", "unknown", "rebooting")
+                    ):
+                        self._hold_reboot_progress()
+                    else:
+                        self._progress = progress_int
+                        self.async_write_ha_state()
                 
                 _LOGGER.debug("Update-Status: %s, Fortschritt: %d%%, Elapsed: %ds", 
-                             status, progress, int(elapsed))
+                             status, progress_int, int(elapsed))
 
-                # Prüfe ob Update abgeschlossen ist
+                # OTA-Topic "done" = Flash fertig, Gerät rebootet danach noch.
+                # UI darf hier NICHT auf "Update verfügbar" zurückfallen.
                 if status in ["done", "complete", "success"]:
-                    _LOGGER.info("Update erfolgreich abgeschlossen nach %d Sekunden", int(elapsed))
-                    break
+                    saw_ota_activity = True
+                    self._progress = 100
+                    self._update_data = {
+                        **(self._update_data or {}),
+                        "status": "rebooting",
+                        "progress": 100,
+                    }
+                    self.async_write_ha_state()
+                    _LOGGER.info(
+                        "OTA-Flash meldet done – warte auf Post-Reboot (MQTT update_needed=false)"
+                    )
+                    # nicht breaken; unten auf Post-Reboot prüfen
                 
                 if status in ["failed", "error"]:
                     error_msg = self._update_data.get("error", "Unbekannter Fehler")
                     _LOGGER.error("Update fehlgeschlagen: %s", error_msg)
                     break
+
+                # Erst nach Reboot: MQTT status mit update_needed=false → Erfolg
+                if self._post_reboot_update_success(
+                    target_version=target_version,
+                    saw_ota_activity=saw_ota_activity,
+                    saw_offline=saw_offline,
+                    elapsed=elapsed,
+                ):
+                    self._progress = 100
+                    self._update_data = {
+                        **(self._update_data or {}),
+                        "status": "done",
+                        "progress": 100,
+                    }
+                    self.async_write_ha_state()
+                    _LOGGER.info(
+                        "Update erfolgreich (Post-Reboot MQTT update_needed=false) nach %d Sekunden",
+                        int(elapsed),
+                    )
+                    break
                 
                 # Prüfe ob Update noch läuft
-                if status not in ["installing", "started", "downloading", "idle"]:
+                if status not in ["installing", "started", "downloading", "idle", "rebooting", "done", "complete", "success", ""]:
                     _LOGGER.warning("Unbekannter Update-Status: %s", status)
                 
                 await asyncio.sleep(check_interval)
                 
             except Exception as e:
                 self._consecutive_errors += 1
-                _LOGGER.warning("Fehler beim Statusabruf (Fehler %d/%d): %s", 
-                               self._consecutive_errors, self._max_consecutive_errors, e)
-                
-                # Wenn zu viele aufeinanderfolgende Fehler, abbrechen
-                if self._consecutive_errors >= self._max_consecutive_errors:
-                    _LOGGER.error("Zu viele aufeinanderfolgende Fehler beim Statusabruf, Update-Überwachung abgebrochen")
+                saw_offline = True
+                if offline_since is None:
+                    offline_since = time.time()
+                self._hold_reboot_progress()
+                _LOGGER.warning(
+                    "Fehler beim Statusabruf (Fehler %d): %s – warte auf Reboot/Online",
+                    self._consecutive_errors,
+                    e,
+                )
+
+                # Erfolg schon erkennbar?
+                if self._post_reboot_update_success(
+                    target_version=target_version,
+                    saw_ota_activity=True,
+                    saw_offline=True,
+                    elapsed=elapsed,
+                ):
+                    self._progress = 100
+                    self._update_data = {
+                        **(self._update_data or {}),
+                        "status": "done",
+                        "progress": 100,
+                    }
+                    self.async_write_ha_state()
+                    _LOGGER.info("Update erfolgreich nach Verbindungsabbrüchen (Post-Reboot)")
+                    break
+
+                # Nach OTA-Aktivität: Offline bis UPDATE_REBOOT_WAIT_SECONDS aushalten
+                offline_for = time.time() - (offline_since or last_successful_check)
+                if saw_ota_activity and offline_for < UPDATE_REBOOT_WAIT_SECONDS:
+                    wait_time = min(check_interval * (2 ** min(self._consecutive_errors - 1, 3)), 10)
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                # Ohne OTA-Aktivität oder Reboot-Wartezeit erschöpft
+                if offline_for >= UPDATE_REBOOT_WAIT_SECONDS or (
+                    not saw_ota_activity and self._consecutive_errors >= self._max_consecutive_errors
+                ):
+                    _LOGGER.error(
+                        "Update-Überwachung abgebrochen (offline %.0fs, ota_activity=%s)",
+                        offline_for,
+                        saw_ota_activity,
+                    )
                     break
                 
-                # Wenn letzter erfolgreicher Check zu lange her, abbrechen
-                if time.time() - last_successful_check > 60:  # 1 Minute ohne erfolgreichen Check
-                    _LOGGER.error("Kein erfolgreicher Status-Check seit 60 Sekunden, Update-Überwachung abgebrochen")
-                    break
-                
-                # Warte länger bei Fehlern (exponentielles Backoff)
                 wait_time = min(check_interval * (2 ** (self._consecutive_errors - 1)), 10)
                 await asyncio.sleep(wait_time)
 
+    def _post_reboot_update_success(
+        self,
+        target_version: Optional[str],
+        saw_ota_activity: bool,
+        saw_offline: bool,
+        elapsed: float,
+    ) -> bool:
+        """Erfolg erst nach Reboot: Station online + update_needed=false (oder Version passt)."""
+        # Vermeide False-Positive ganz am Anfang der Install-Schleife
+        if not (saw_ota_activity or saw_offline or elapsed >= 20):
+            return False
+
+        station = (self.coordinator.data or {}).get(self.station_id) or {}
+        if not station.get("available", False):
+            return False
+
+        current = station.get("current_version") or station.get("firmware_version")
+        version_ok = bool(
+            target_version
+            and current
+            and str(current).strip() == str(target_version).strip()
+        )
+
+        # Flash kann "done" melden bevor der Reboot beginnt – ohne Offline/Versionswechsel
+        # noch nicht als fertig werten (sonst wieder "Update verfügbar" + Aktualisieren).
+        if saw_ota_activity and not saw_offline and not version_ok:
+            return False
+
+        update_needed = station.get("update_needed")
+        if update_needed is None and not version_ok:
+            return False
+        if update_needed is not None and bool(update_needed) and not version_ok:
+            return False
+
+        if version_ok:
+            return True
+
+        # update_needed=false nach Offline, Versionen ggf. noch nicht synchron
+        _LOGGER.debug(
+            "Post-Reboot: update_needed=false, Versionen differieren (ist=%s ziel=%s) – trotzdem Erfolg",
+            current,
+            target_version,
+        )
+        return True
+
     async def _fetch_update_status(self):
-        """Hole Update-Status vom PlantBot-Gerät mit besserem Error-Handling."""
-        # Prefer MQTT-pushed update status from coordinator (avoids polling)
+        """Hole Update-Status ausschließlich aus MQTT (Coordinator)."""
         try:
             station = (self.coordinator.data or {}).get(self.station_id) or {}
             mqtt_update = station.get("firmware_update")
@@ -574,36 +744,6 @@ class PlantbotFirmwareUpdate(UpdateEntity):
         except Exception as e:
             _LOGGER.debug("MQTT Update-Status aus Coordinator nicht nutzbar: %s", e)
 
-        url = f"http://{self._station_ip}/update_status"
-        timeout = aiohttp.ClientTimeout(total=10, connect=5)
-        
-        try:
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.get(url) as resp:
-                    if resp.status == 200:
-                        try:
-                            self._update_data = await resp.json()
-                            _LOGGER.debug("Update-Status erhalten: %s", self._update_data)
-                        except Exception as e:
-                            _LOGGER.warning("Ungültiges JSON in Update-Status: %s", e)
-                            self._update_data = {}
-                    elif resp.status == 503:
-                        # Service Unavailable - Update läuft möglicherweise
-                        _LOGGER.debug("Update-Status-Endpoint antwortet mit 503 (Service Unavailable)")
-                        self._update_data = {"status": "installing", "progress": self._progress or 0}
-                    else:
-                        _LOGGER.debug("Update-Status-Endpoint antwortete mit HTTP %s", resp.status)
-                        self._update_data = {}
-        except asyncio.TimeoutError:
-            _LOGGER.debug("Timeout beim Abrufen des Update-Status")
-            # Behalte letzten bekannten Status bei
-            if not self._update_data:
-                self._update_data = {"status": "unknown", "progress": self._progress or 0}
-        except aiohttp.ClientError as e:
-            _LOGGER.warning("Client-Fehler beim Abrufen des Update-Status: %s", e)
-            if not self._update_data:
-                self._update_data = {"status": "unknown", "progress": self._progress or 0}
-        except Exception as e:
-            _LOGGER.warning("Unerwarteter Fehler beim Abrufen des Update-Status: %s", e)
-            if not self._update_data:
-                self._update_data = {"status": "unknown", "progress": self._progress or 0}
+        # Kein HTTP-Fallback – letzten bekannten Stand behalten
+        if not self._update_data:
+            self._update_data = {"status": "unknown", "progress": self._progress or 0}

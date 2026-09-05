@@ -76,15 +76,82 @@ Keine Server-API — Pflanzennamen und Job-Warteschlange fehlen; Ventile und Sen
 | `plantbot.open_for_seconds` | Ventil für eine Dauer öffnen |
 | `plantbot.open_for_volume` | Ventil bis zu einer Menge (ml) öffnen |
 
-### Event (nur Server-Modus)
+### Events (Automation per YAML)
 
-Nach einem abgeschlossenen Server-Gießjob (`job_id > 0`):
+Die neue HA-Automation-UI zeigt Custom-Device-Trigger oft nicht. Nutze deshalb **Ereignis-Trigger** in YAML (`automations.yaml` oder Automation → ⋮ → Als YAML bearbeiten).
 
-**Event-Typ:** `plantbot_watering_finished`
+Events kommen in **Server- und Device-Modus**, sobald die Station ein ACK mit `job_id >= 0` sendet:
 
-Typische Daten: `station_id`, `station_name`, `job_id`, `status`, `plant_name`, `pump_number`, `valve_number`, `amount_ml`, `duration_seconds`, optional `error` / `fertilizer`.
+| `job_id` | Herkunft | Event? |
+|----------|----------|--------|
+| `> 0` | Server-Gießjob | ja |
+| `= 0` | HA Zeit-/Volumen-Gießen | ja |
+| `< 0` | reines Ventil auf/zu | nein |
 
-Direkte Ventilbefehle aus HA erzeugen **kein** Event (kein ACK).
+#### `plantbot_watering_finished`
+
+Nach Gießende (`status`: `completed` / `failed` / `cancelled`).
+
+Daten u. a.: `station_id`, `station_name`, `device_id`, `job_id`, `status`, `plant_name`, `pump_number`, `valve_number`, `amount_ml`, `duration_seconds`, optional `error` / `fertilizer`.
+
+```yaml
+- alias: PlantBot Gießen fertig
+  triggers:
+    - trigger: event
+      event_type: plantbot_watering_finished
+      event_data:
+        status: completed
+  actions:
+    - action: notify.persistent_notification
+      data:
+        title: Gießen fertig
+        message: >-
+          {{ trigger.event.data.plant_name }}:
+          {{ trigger.event.data.amount_ml }} ml
+          in {{ trigger.event.data.duration_seconds }} s
+
+- alias: PlantBot Gießen fehlgeschlagen
+  triggers:
+    - trigger: event
+      event_type: plantbot_watering_finished
+      event_data:
+        status: failed
+  actions:
+    - action: notify.persistent_notification
+      data:
+        title: Gießen fehlgeschlagen
+        message: >-
+          {{ trigger.event.data.plant_name }}:
+          {{ trigger.event.data.error | default('unbekannt') }}
+```
+
+#### `plantbot_alert`
+
+MQTT `plantbot/{ip}/alerts` (z. B. Wasserstand).
+
+Daten u. a.: `station_id`, `station_name`, `device_id`, `code`, `state` (`active` / `cleared`), `severity`, `label`, optional `water_level_cm` / `min_water_cm`.
+
+```yaml
+- alias: PlantBot Wasserstand niedrig
+  triggers:
+    - trigger: event
+      event_type: plantbot_alert
+      event_data:
+        code: water_level_low
+        state: active
+  actions:
+    - action: notify.persistent_notification
+      data:
+        title: Wasserstand niedrig
+        message: >-
+          {{ trigger.event.data.station_name }}:
+          {{ trigger.event.data.water_level_cm }} cm
+          (min {{ trigger.event.data.min_water_cm }} cm)
+```
+
+Optional in `event_data` weiter filtern, z. B. `station_name: Test` oder `device_id: …`.
+
+Sensor **Alert-Status** zeigt aktive Alerts zusätzlich als Entity (Attribute: `alerts`, `last_alert`).
 
 ---
 
@@ -99,8 +166,8 @@ Direkte Ventilbefehle aus HA erzeugen **kein** Event (kein ACK).
                     Entities, Services, Events
 ```
 
-- **MQTT:** Sensoren, Status (inkl. `flow`, `last_volume_ml`, `water_runtime`, `latest_version`, `update_needed`), Ventile, Gieß-Logs/ACKs, OTA-Fortschritt
-- **HTTP:** OTA starten (`/Github_update`), Reset, Erreichbarkeitscheck — kein periodisches `/status`-Polling
+- **MQTT:** Sensoren, Status (inkl. `flow`, `last_volume_ml`, `water_runtime`, `latest_version`, `update_needed`), Ventile, Gieß-Logs/ACKs, Alerts, OTA-Fortschritt
+- **HTTP:** OTA starten (`/Github_update`), Reset — kein periodisches `/status`-Polling
 - **Availability:** Station online, solange MQTT-Nachrichten kommen (Timeout ~120 s)
 - **Snapshot:** HA sendet beim Start und alle 5 Min `plantbot/{ip}/commands/status_request`
 
@@ -133,7 +200,7 @@ Bei Publish füllen GitHub-Workflows die Release-Body aus diesen Dateien.
 | Alles „Nicht verfügbar“ | MQTT-Broker falsch / HA und Station nicht am gleichen Broker / Station offline |
 | Sensoren „Unbekannt“, Status aber ok | Erweiterte Status-Felder fehlen → Firmware zu alt |
 | Update-Entity zeigt nichts Neues | Firmware ohne `latest_version` im MQTT-Status; Integration neu laden |
-| Event bleibt aus | Nur Server-Jobs mit `job_id > 0`; Ventil-Services senden kein ACK |
+| Event bleibt aus | Nur ACK mit `job_id >= 0` (Server-Job oder HA Zeit/Volumen); reines Ventil auf/zu hat kein Event |
 | Falsche / tote Entities nach Update | Alte Entity-Keys — verwaiste Entities löschen, Integration neu laden |
 
 MQTT-Check (Beispiel):
@@ -153,6 +220,7 @@ custom_components/plantbot/
   config_flow.py     # UI-Setup (Server / Device / MQTT)
   coordinator.py     # Server-API + MQTT
   sensor.py / valve.py / update.py / button.py
+  device_trigger.py  # Device-Trigger (UI oft unvollständig → Events/YAML)
   services.yaml
 docs/releases/       # Release Notes pro Tag
 ```

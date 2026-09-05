@@ -2,7 +2,7 @@ import logging
 from datetime import timedelta
 import aiohttp
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
-from .const import DOMAIN, EVENT_WATERING_FINISHED
+from .const import DOMAIN, EVENT_WATERING_FINISHED, EVENT_ALERT, ALERT_CODE_LABELS
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import asyncio
 import json
@@ -12,11 +12,9 @@ from aiomqtt.exceptions import MqttError
 
 _LOGGER = logging.getLogger(__name__)
 
-# Legacy HTTP /status (nur noch Fallback / OTA-Hilfen)
-STATUS_REQUEST_TIMEOUT = 15
 # Station gilt als offline, wenn länger keine MQTT-Nachricht kam
 MQTT_STALE_SECONDS = 120
-# Gelegentlicher Snapshot-Request statt HTTP-Polling
+# Gelegentlicher Snapshot-Request (MQTT status_request)
 MQTT_STATUS_REQUEST_INTERVAL = 300
 
 # Felder, die per MQTT live aktualisiert werden und beim Server-Refresh erhalten bleiben müssen
@@ -28,6 +26,11 @@ LIVE_MQTT_FIELDS = (
     "flow",
     "lastVolume",
     "water_runtime",
+    "watering_percent",
+    "watering_remaining_ml",
+    "watering_remaining_seconds",
+    "alerts",
+    "alert_status",
     "last_reset_reason",
     "runtime",
     "memory_usage",
@@ -41,6 +44,7 @@ LIVE_MQTT_FIELDS = (
     "last_ack",
     "current_watering_volume",
     "current_watering_duration",
+    "last_alert",
 )
 
 # Server-Entity-Key → MQTT-Key (PlantBot JSON)
@@ -61,6 +65,45 @@ def _mqtt_entity_key(key: str | None) -> str | None:
     if not key:
         return None
     return ENTITY_KEY_TO_MQTT.get(key, key)
+
+
+def _apply_watering_remaining(station: dict, water: dict | None, status: str | None) -> None:
+    """Berechne Restvolumen/-zeit aus Log-Feldern; bei Job-Ende auf 0."""
+    if status in ("completed", "failed", "cancelled", "idle") or not water:
+        station["watering_remaining_ml"] = 0
+        station["watering_remaining_seconds"] = 0
+        return
+
+    planned_ml = water.get("planned_amount_ml")
+    actual_ml = water.get("actual_amount_ml")
+    planned_s = water.get("planned_duration_seconds")
+    actual_s = water.get("actual_duration_seconds")
+    percent = water.get("percent")
+
+    rem_ml = None
+    try:
+        if planned_ml is not None and actual_ml is not None:
+            rem_ml = max(0.0, float(planned_ml) - float(actual_ml))
+        elif planned_ml is not None and percent is not None:
+            rem_ml = max(0.0, float(planned_ml) * (100.0 - float(percent)) / 100.0)
+    except (TypeError, ValueError):
+        rem_ml = None
+
+    rem_s = None
+    try:
+        if planned_s is not None and actual_s is not None:
+            rem_s = max(0.0, float(planned_s) - float(actual_s))
+        elif planned_s is not None and percent is not None:
+            rem_s = max(0.0, float(planned_s) * (100.0 - float(percent)) / 100.0)
+        elif actual_s is not None and percent is not None and float(percent) > 0:
+            rem_s = max(0.0, float(actual_s) * (100.0 - float(percent)) / float(percent))
+    except (TypeError, ValueError):
+        rem_s = None
+
+    if rem_ml is not None:
+        station["watering_remaining_ml"] = round(rem_ml, 1)
+    if rem_s is not None:
+        station["watering_remaining_seconds"] = int(round(rem_s))
 
 
 def _sensoren_from_server_devices(devices: list) -> dict:
@@ -199,7 +242,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             # MQTT-Updates, die während des Server-Fetches kamen, nicht überschreiben
             result = self._merge_all_live_data(result)
 
-            # Gelegentlich Snapshot per MQTT anfordern (statt HTTP /status)
+            # Gelegentlich Snapshot per MQTT anfordern
             if result and self.mqtt_broker:
                 now = time.time()
                 if now - self._last_status_request >= MQTT_STATUS_REQUEST_INTERVAL:
@@ -581,6 +624,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             "flow",
             "lastVolume",
             "water_runtime",
+            "watering_percent",
             "last_reset_reason",
             "runtime",
             "memory_usage",
@@ -637,107 +681,6 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             _LOGGER.warning("status_request fehlgeschlagen für %s: %s", ip, e)
             return False
 
-    async def _fetch_from_device(self, ip):
-        """Legacy HTTP GET /status – nur noch als Fallback nutzbar."""
-        # Verwende /status Endpoint mit GET (wie im Hardware-Code definiert)
-        endpoint = f"http://{ip}/status"
-        
-        try:
-            async with self.session.get(
-                endpoint, ssl=False, timeout=STATUS_REQUEST_TIMEOUT
-            ) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    _LOGGER.debug("Daten von PlantBot %s erhalten (GET /status): %s", ip, data)
-                    
-                    # /status gibt direktes Station-Objekt mit Sensoren zurück
-                    if isinstance(data, dict):
-                        station_id = data.get("id", ip)
-                        # Normalisiere station_id
-                        if isinstance(station_id, str) and station_id.startswith("station_"):
-                            station_id = station_id.replace("station_", "")
-                        station_id = station_id or ip
-                        
-                        data["source"] = "device"
-                        data["ip"] = ip
-                        data["id"] = str(station_id)
-                        data["available"] = True
-                        
-                        # Stelle sicher, dass alle benötigten Felder vorhanden sind
-                        data.setdefault("Sensoren", {})
-                        data.setdefault("num_pumps", 1)
-                        data.setdefault("num_valves", 8)
-                        data.setdefault("plant_mapping", {})
-                        data.setdefault("sensor_mapping", {})
-                        
-                        return {f"station_{station_id}": data}
-                    else:
-                        _LOGGER.warning("Unerwartetes Datenformat von %s: %s", endpoint, type(data))
-                        # Treat as offline-ish but keep cached data
-                        station_id = ip
-                        cached = {}
-                        if isinstance(self.data, dict):
-                            cached = (self.data.get(f"station_{station_id}") or {}).copy()
-                        cached.update(
-                            {
-                                "source": cached.get("source", "device"),
-                                "ip": ip,
-                                "id": str(station_id),
-                                "available": False,
-                                "offline_reason": "bad_payload",
-                            }
-                        )
-                        return {f"station_{station_id}": cached}
-                else:
-                    _LOGGER.warning("PlantBot %s nicht erreichbar: HTTP %s", ip, response.status)
-                    station_id = ip
-                    cached = {}
-                    if isinstance(self.data, dict):
-                        cached = (self.data.get(f"station_{station_id}") or {}).copy()
-                    cached.update(
-                        {
-                            "source": cached.get("source", "device"),
-                            "ip": ip,
-                            "id": str(station_id),
-                            "available": False,
-                            "offline_reason": f"http_{response.status}",
-                        }
-                    )
-                    return {f"station_{station_id}": cached}
-        except asyncio.TimeoutError:
-            _LOGGER.warning("PlantBot %s offline (Timeout %ss)", ip, STATUS_REQUEST_TIMEOUT)
-            station_id = ip
-            cached = {}
-            if isinstance(self.data, dict):
-                cached = (self.data.get(f"station_{station_id}") or {}).copy()
-            cached.update(
-                {
-                    "source": cached.get("source", "device"),
-                    "ip": ip,
-                    "id": str(station_id),
-                    "available": False,
-                    "offline_reason": "timeout",
-                }
-            )
-            return {f"station_{station_id}": cached}
-        except Exception as e:
-            # Common when device is offline/rebooting; don't raise UpdateFailed to avoid ERROR tracebacks.
-            _LOGGER.warning("PlantBot %s offline (%s)", ip, e)
-            station_id = ip
-            cached = {}
-            if isinstance(self.data, dict):
-                cached = (self.data.get(f"station_{station_id}") or {}).copy()
-            cached.update(
-                {
-                    "source": cached.get("source", "device"),
-                    "ip": ip,
-                    "id": str(station_id),
-                    "available": False,
-                    "offline_reason": "error",
-                }
-            )
-            return {f"station_{station_id}": cached}
-
     def _get_mqtt_client_config(self, client_id):
         """Erstelle MQTT-Client-Konfiguration (wiederverwendbar)."""
         client_kwargs = {
@@ -771,6 +714,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 payload["duration"] = int(kwargs["duration"])
             if "volume" in kwargs:
                 payload["volume"] = int(kwargs["volume"])
+            if kwargs.get("plant_name"):
+                payload["plant_name"] = str(kwargs["plant_name"])
             
             topic = f"plantbot/{ip}/commands/valve"
             payload_json = json.dumps(payload)
@@ -868,7 +813,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                     continue
                 
                 # Topics für diese Station
-                topic_suffixes = ("logs", "ack", "update", "sensors", "status", "valves")
+                topic_suffixes = ("logs", "ack", "update", "sensors", "status", "valves", "alerts")
                 for suffix in topic_suffixes:
                     topic = f"plantbot/{ip}/{suffix}"
                     if topic not in self._subscribed_topics:
@@ -930,6 +875,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 await self._handle_status_message(station_id, station_data, data)
             elif message_type == "valves":
                 await self._handle_valves_message(station_id, station_data, data)
+            elif message_type == "alerts":
+                await self._handle_alert_message(station_id, station_data, data)
             else:
                 _LOGGER.warning("Unbekannter MQTT-Message-Typ: %s (Topic: %s)", message_type, topic)
             
@@ -977,7 +924,6 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             if status_data.get("latest_version") is not None:
                 station["latest_version"] = status_data.get("latest_version")
             if status_data.get("update_needed") is not None:
-                # Firmware sends 0/1; keep truthy for HA update entity
                 station["update_needed"] = bool(status_data.get("update_needed"))
             if status_data.get("wifi_rssi") is not None:
                 station["wifi"] = status_data.get("wifi_rssi")
@@ -985,6 +931,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 station["memory_usage"] = status_data.get("free_heap")
             if status_data.get("uptime_seconds") is not None:
                 station["runtime"] = status_data.get("uptime_seconds")
+            # Legacy: ältere Firmware sendete flow/volume/runtime noch im Status
             if status_data.get("flow") is not None:
                 station["flow"] = status_data.get("flow")
             if status_data.get("last_volume_ml") is not None:
@@ -997,10 +944,16 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 station["last_reset_reason"] = status_data.get("last_reset_reason")
             if status_data.get("online") is False:
                 station["status"] = "offline"
-            elif status_data.get("watering") or station.get("watering_status") == "running":
+            elif status_data.get("watering") is True:
+                # Backup falls Logs noch nicht kamen
                 station["status"] = "am Gießen"
-            else:
+                station["watering_status"] = "running"
+            elif status_data.get("watering") is False:
+                # Idle-Signal: Logs setzen "am Gießen", Status watering:false → wieder bereit
                 station["status"] = "bereit"
+                station["watering_status"] = "idle"
+                station["flow"] = 0
+                _apply_watering_remaining(station, None, "idle")
             self._touch_mqtt_seen(station)
             updated_data[station_id] = station
             self.async_set_updated_data(updated_data)
@@ -1024,6 +977,90 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         except Exception as e:
             _LOGGER.error("Fehler beim Verarbeiten der Valves-Nachricht: %s", e)
 
+    @staticmethod
+    def _format_alert_status(alerts: dict) -> str:
+        """Menschenlesbarer Alert-Status für Sensor."""
+        if not alerts:
+            return "ok"
+        labels = []
+        for code in alerts:
+            labels.append(ALERT_CODE_LABELS.get(code, code))
+        return ", ".join(labels)
+
+    async def _handle_alert_message(self, station_id, station_data, alert_data):
+        """Station-Alerts von plantbot/{ip}/alerts."""
+        try:
+            if not self.data or station_id not in self.data:
+                return
+            if not isinstance(alert_data, dict):
+                return
+
+            code = alert_data.get("code")
+            state = alert_data.get("state")
+            if not code or not state:
+                _LOGGER.warning("Alert ohne code/state ignoriert: %s", alert_data)
+                return
+
+            updated_data = self.data.copy()
+            station = updated_data[station_id].copy()
+            alerts = dict(station.get("alerts") or {})
+
+            if state == "cleared":
+                alerts.pop(code, None)
+            else:
+                alerts[code] = {
+                    "state": state,
+                    "severity": alert_data.get("severity", "warning"),
+                    "water_level_cm": alert_data.get("water_level_cm"),
+                    "min_water_cm": alert_data.get("min_water_cm"),
+                    "ts": alert_data.get("ts"),
+                }
+
+            station["alerts"] = alerts
+            station["alert_status"] = self._format_alert_status(alerts)
+            station["last_alert"] = alert_data
+            self._touch_mqtt_seen(station)
+            updated_data[station_id] = station
+            self.async_set_updated_data(updated_data)
+
+            event_data = {
+                "station_id": station_id,
+                "station_name": station.get("name"),
+                "code": code,
+                "state": state,
+                "severity": alert_data.get("severity", "warning"),
+                "label": ALERT_CODE_LABELS.get(code, code),
+                "water_level_cm": alert_data.get("water_level_cm"),
+                "min_water_cm": alert_data.get("min_water_cm"),
+                "alert_status": station["alert_status"],
+            }
+            device_id = self._device_id_for_station(station_id)
+            if device_id:
+                event_data["device_id"] = device_id
+
+            self.hass.bus.async_fire(EVENT_ALERT, event_data)
+            _LOGGER.info(
+                "Alert %s: station=%s code=%s state=%s",
+                EVENT_ALERT,
+                station.get("name"),
+                code,
+                state,
+            )
+        except Exception as e:
+            _LOGGER.error("Fehler beim Verarbeiten der Alert-Nachricht: %s", e)
+
+    def _status_from_watering_log(self, log_data: dict) -> str | None:
+        """Aktiv-Status aus /logs. 'bereit' kommt nur von MQTT status mit watering:false."""
+        status = log_data.get("status", "running")
+        phase = log_data.get("phase", "")
+        if status != "running" or phase == "done":
+            return None
+        if phase == "dose":
+            return "am Düngen"
+        if phase == "flush":
+            return "am Spülen"
+        return "am Gießen"
+
     async def _handle_log_message(self, station_id, station_data, log_data):
         """Verarbeite Log-Nachricht (Live-Updates während des Gießens)."""
         try:
@@ -1037,29 +1074,48 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             if station_id in updated_data:
                 station = updated_data[station_id].copy()
                 
-                # Füge Log-Daten hinzu
-                station["last_log"] = log_data
+                water = log_data.get("water") if isinstance(log_data.get("water"), dict) else {}
+                fert = log_data.get("fertilizer") if isinstance(log_data.get("fertilizer"), dict) else {}
+
+                # Merge: fehlende Blöcke behalten (phase-abhängig nur einer aktiv)
+                prev_log = station.get("last_log") or {}
+                merged_log = dict(log_data)
+                if not water and isinstance(prev_log.get("water"), dict):
+                    merged_log["water"] = prev_log["water"]
+                    water = prev_log["water"]
+                if not fert and isinstance(prev_log.get("fertilizer"), dict):
+                    merged_log["fertilizer"] = prev_log["fertilizer"]
+                station["last_log"] = merged_log
+
                 status = log_data.get("status", "running")
                 station["watering_status"] = status
-                
-                # Aktualisiere aktuelle Werte
-                if "actual_amount_ml" in log_data:
-                    station["current_watering_volume"] = log_data["actual_amount_ml"]
-                    # Aktualisiere auch lastVolume für Sensor
-                    station["lastVolume"] = log_data["actual_amount_ml"]
-                if "actual_duration_seconds" in log_data:
-                    station["current_watering_duration"] = log_data["actual_duration_seconds"]
-                    # Aktualisiere auch water_runtime für Sensor
-                    station["water_runtime"] = log_data["actual_duration_seconds"]
-                
-                # NEU: Aktualisiere Flow-Wert aus Logs (falls vorhanden)
-                if "flow" in log_data:
-                    station["flow"] = log_data["flow"]
-                    _LOGGER.debug("Flow-Wert aktualisiert via MQTT Log: %s", log_data["flow"])
-                
-                # NEU: Aktualisiere Ventil-Status basierend auf Log-Daten
-                pump_number = log_data.get("pump_number")
-                valve_number = log_data.get("valve_number")
+                display_status = self._status_from_watering_log(log_data)
+                if display_status is not None:
+                    station["status"] = display_status
+
+                # Aktualisiere aktuelle Werte aus nested water (wenn vorhanden)
+                if water.get("actual_amount_ml") is not None:
+                    station["current_watering_volume"] = water["actual_amount_ml"]
+                    station["lastVolume"] = water["actual_amount_ml"]
+                if water.get("actual_duration_seconds") is not None:
+                    station["current_watering_duration"] = water["actual_duration_seconds"]
+                    station["water_runtime"] = water["actual_duration_seconds"]
+                if water.get("flow") is not None:
+                    # Nach Job-Ende kein Rest-Flow anzeigen
+                    if status in ("completed", "failed", "cancelled"):
+                        station["flow"] = 0
+                    else:
+                        station["flow"] = water["flow"]
+                        _LOGGER.debug("Flow-Wert aktualisiert via MQTT Log: %s", water["flow"])
+                elif status in ("completed", "failed", "cancelled"):
+                    station["flow"] = 0
+                if water.get("percent") is not None:
+                    station["watering_percent"] = water["percent"]
+
+                _apply_watering_remaining(station, water, status)
+
+                pump_number = water.get("pump_number")
+                valve_number = water.get("valve_number")
                 
                 if pump_number and valve_number:
                     # Stelle sicher, dass valves Array existiert
@@ -1101,9 +1157,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 
                 _LOGGER.debug("Station %s aktualisiert mit Log-Daten: %s ml, %s s, Flow: %s", 
                              station_id, 
-                             log_data.get("actual_amount_ml", 0),
-                             log_data.get("actual_duration_seconds", 0),
-                             log_data.get("flow", "N/A"))
+                             water.get("actual_amount_ml", 0),
+                             water.get("actual_duration_seconds", 0),
+                             water.get("flow", "N/A"))
         except Exception as e:
             _LOGGER.error("Fehler beim Verarbeiten der Log-Nachricht: %s", e)
 
@@ -1115,8 +1171,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         if pump_number is None or valve_number is None:
             last_log = station.get("last_log") or {}
             if last_log.get("job_id") == ack_data.get("job_id"):
-                pump_number = pump_number if pump_number is not None else last_log.get("pump_number")
-                valve_number = valve_number if valve_number is not None else last_log.get("valve_number")
+                water = last_log.get("water") if isinstance(last_log.get("water"), dict) else {}
+                pump_number = pump_number if pump_number is not None else water.get("pump_number")
+                valve_number = valve_number if valve_number is not None else water.get("valve_number")
 
         plant_name = ack_data.get("plant_name")
         if not plant_name and pump_number is not None and valve_number is not None:
@@ -1129,13 +1186,11 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         return plant_name, pump_number, valve_number
 
     def _fire_watering_finished_event(self, station_id: str, station: dict, ack_data: dict) -> None:
-        """Fire homeassistant event when a server watering job finishes (ACK with job_id > 0)."""
-        if self.connection_type != "server":
-            return
-
+        """Fire homeassistant event when a watering job finishes (ACK with job_id >= 0)."""
         job_id = ack_data.get("job_id")
         try:
-            if job_id is None or int(job_id) <= 0:
+            # job_id > 0: Server-Job; job_id == 0: HA Zeit/Volumen; negativ: reines Ventil (kein Event)
+            if job_id is None or int(job_id) < 0:
                 return
         except (TypeError, ValueError):
             return
@@ -1156,6 +1211,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             "amount_ml": ack_data.get("actual_amount_ml"),
             "duration_seconds": ack_data.get("actual_duration_seconds"),
         }
+        device_id = self._device_id_for_station(station_id)
+        if device_id:
+            event_data["device_id"] = device_id
         if ack_data.get("error"):
             event_data["error"] = ack_data["error"]
         fertilizer = ack_data.get("fertilizer")
@@ -1164,13 +1222,26 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
 
         self.hass.bus.async_fire(EVENT_WATERING_FINISHED, event_data)
         _LOGGER.info(
-            "Event %s: station=%s plant=%s status=%s job_id=%s",
+            "Event %s: station=%s plant=%s status=%s job_id=%s device_id=%s",
             EVENT_WATERING_FINISHED,
             station.get("name"),
             plant_name,
             status,
             job_id,
+            device_id,
         )
+
+    def _device_id_for_station(self, station_id: str) -> str | None:
+        """HA device_id zur Station (für Device-Trigger / Event-Attribut)."""
+        from homeassistant.helpers import device_registry as dr
+
+        from .const import station_device_identifiers
+
+        registry = dr.async_get(self.hass)
+        device = registry.async_get_device(
+            identifiers=station_device_identifiers(station_id)
+        )
+        return device.id if device else None
 
     async def _handle_ack_message(self, station_id, station_data, ack_data):
         """Verarbeite ACK-Nachricht (Bewässerung beendet)."""
@@ -1193,6 +1264,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 if status in ["completed", "failed", "cancelled"]:
                     station["current_watering_volume"] = ack_data.get("actual_amount_ml", 0)
                     station["current_watering_duration"] = ack_data.get("actual_duration_seconds", 0)
+                    station["flow"] = 0
+                    _apply_watering_remaining(station, None, status)
                     # Aktualisiere auch lastVolume und water_runtime für Sensoren
                     if "actual_amount_ml" in ack_data:
                         station["lastVolume"] = ack_data["actual_amount_ml"]

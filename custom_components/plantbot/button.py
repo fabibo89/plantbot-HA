@@ -3,7 +3,7 @@ from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 import logging
 
-from .const import DOMAIN
+from .const import DOMAIN, station_device_identifiers
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,7 +55,7 @@ class PlantBotHttpButton(ButtonEntity):
     @property
     def device_info(self):
         return {
-            "identifiers": {(DOMAIN, f"station_{self.station_id}")},
+            "identifiers": station_device_identifiers(self.station_id),
             "name": self.station_name,
             "manufacturer": "PlantBot",
             "model": "Bewässerungsstation",
@@ -149,7 +149,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 station_ip,
                 suffix="reset",
                 name=f"Reset {station_name}",
-                path="/HA/reset",
+                path="/restart",
                 icon="mdi:restart",
             )
         )

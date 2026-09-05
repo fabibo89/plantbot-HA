@@ -1,6 +1,6 @@
 import logging
 from homeassistant.components.valve import ValveEntity, ValveEntityFeature
-from .const import DOMAIN
+from .const import DOMAIN, station_device_identifiers
 from homeassistant.core import callback
 from homeassistant.components.valve import ValveDeviceClass
 from homeassistant.exceptions import HomeAssistantError
@@ -47,7 +47,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
                 plant_name = plant_mapping.get(lookup_key)
                 
                 if plant_name:
-                    valve_name = f"{plant_name} (P:{pump_number},V:{valve_number})"
+                    valve_name = plant_name
                 else:
                     valve_name = f"Pumpe: {pump_number} / Ventil: {valve_number}"
                 
@@ -93,12 +93,12 @@ class PlantbotHAValve(ValveEntity):
         return bool(station_data.get("available", True)) and self._get_valve() is not None
 
     def _get_valve(self):
-        """Hole Ventil-Status vom PlantBot /status Endpoint."""
+        """Hole Ventil-Status aus Coordinator-Daten (MQTT valves)."""
         station = self.coordinator.data.get(self.station_id, {})
         valves = station.get("valves", [])
 
         # Suche nach Ventil mit passender pump_number und valve_id
-        # Der /status Endpoint gibt pump_no und valve_no zurück
+        # MQTT /valves liefert pump_no und valve_no
         for v in valves:
             # Unterstütze beide Formate für Rückwärtskompatibilität
             valve_no = v.get("valve_no") or v.get("id")
@@ -114,6 +114,16 @@ class PlantbotHAValve(ValveEntity):
         _LOGGER.debug("Valve %s (Pumpe %s) nicht im Status gefunden für Station %s, verwende Standard", 
                      self.valve_id, self.pump_number, self.station_id)
         return {"valve_no": int(self.valve_id), "pump_no": self.pump_number, "state": "closed"}
+
+    def _resolve_plant_name(self) -> str:
+        """Anzeigename des Ventils (inkl. HA-Umbenennung in der Entity-Registry)."""
+        # HA 2026.9+: kein Entity.friendly_name mehr; Rename liegt in registry_entry.name
+        if self.registry_entry and self.registry_entry.name:
+            return self.registry_entry.name
+        name = self.name
+        if isinstance(name, str) and name:
+            return name
+        return self.valve_name or f"Ventil {self.valve_id}"
 
     async def async_open_valve(self, **kwargs):
         if not self.station_ip:
@@ -159,7 +169,7 @@ class PlantbotHAValve(ValveEntity):
     @property
     def device_info(self):
         info = {
-            "identifiers": {(DOMAIN, f"station_{self.station_id}")},
+            "identifiers": station_device_identifiers(self.station_id),
             "name": self.station_name,
             "manufacturer": "PlantBot",
             "model": "Bewässerungsstation",
@@ -178,7 +188,8 @@ class PlantbotHAValve(ValveEntity):
             self.pump_number,
             self.valve_id,
             "open",
-            duration=duration
+            duration=duration,
+            plant_name=self._resolve_plant_name(),
         )
         if not success:
             raise HomeAssistantError(f"Fehler beim Öffnen des Ventils für {duration} Sekunden")
@@ -193,7 +204,8 @@ class PlantbotHAValve(ValveEntity):
             self.pump_number,
             self.valve_id,
             "open",
-            volume=volume
+            volume=volume,
+            plant_name=self._resolve_plant_name(),
         )
         if not success:
             raise HomeAssistantError(f"Fehler beim Öffnen des Ventils für {volume} ml")
