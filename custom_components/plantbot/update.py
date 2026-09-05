@@ -186,6 +186,32 @@ class PlantbotFirmwareUpdate(UpdateEntity):
         )
         return None if value in (None, "", "null") else str(value)
 
+    def version_is_newer(self, latest_version: str, installed_version: str) -> bool:
+        """Ob latest wirklich neuer ist als installed.
+
+        Home Assistant nutzt AwesomeVersion: griechische Pre-Release-Tags werden
+        alphabetisch verglichen (delta < gamma) → State bleibt fälschlich ``off``.
+        PlantBot verlässt sich auf MQTT ``update_needed`` bzw. String-Ungleichheit.
+        """
+        latest = (latest_version or "").strip()
+        installed = (installed_version or "").strip()
+        if not latest or not installed or latest == installed:
+            return False
+
+        if not self.coordinator.data or self.station_id not in self.coordinator.data:
+            return True
+
+        station_data = self.coordinator.data[self.station_id]
+        firmware = station_data.get("Firmware") or {}
+        flagged = firmware.get("update_needed")
+        if flagged is None:
+            flagged = station_data.get("update_needed")
+        if flagged is not None:
+            return bool(flagged)
+
+        # Unterschiedliche Tags ohne Flag → Update anbieten
+        return True
+
     @property
     def available(self):
         # Während OTA/Reboot Entity verfügbar halten, sonst springt die HA-UI
@@ -204,14 +230,16 @@ class PlantbotFirmwareUpdate(UpdateEntity):
         
         station_data = self.coordinator.data[self.station_id]
         firmware = station_data.get("Firmware", {})
-        update_needed = firmware.get("update_needed") or station_data.get("update_needed")
+        update_needed = firmware.get("update_needed")
+        if update_needed is None:
+            update_needed = station_data.get("update_needed")
         
-        # Fallback: Versionsnummern vergleichen
+        # Fallback: Versionsnummern vergleichen (nicht AwesomeVersion/alpha-sort)
         if update_needed is None:
             installed = self.installed_version
             latest = self.latest_version
             if installed and latest:
-                return installed != latest
+                return installed.strip() != latest.strip()
         
         return bool(update_needed)
 
