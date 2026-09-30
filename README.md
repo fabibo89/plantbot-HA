@@ -187,7 +187,7 @@ Versionshistorie und Pre-Releases:
 
 → [`docs/releases/`](docs/releases/)
 
-Aktuell z. B. [v1.2.10-gamma](docs/releases/v1.2.10-gamma.md) (Firmware ≥ 1.3.0-gamma).
+Aktuell z. B. [v1.2.10-delta](docs/releases/v1.2.10-delta.md) (Firmware ≥ 1.3.0-gamma).
 
 Bei Publish füllen GitHub-Workflows die Release-Body aus diesen Dateien.
 
