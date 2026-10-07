@@ -250,10 +250,10 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 )
                 result = self.data
 
-            self._refresh_mqtt_availability(result)
-
-            # MQTT-Updates, die während des Server-Fetches kamen, nicht überschreiben
+            # WICHTIG: Erst MQTT-Daten einmergen (inkl. last_mqtt_seen), DANN Availability prüfen!
+            # Sonst werden Stationen auf unavailable gesetzt, obwohl gerade MQTT-Daten reinkamen.
             result = self._merge_all_live_data(result)
+            self._refresh_mqtt_availability(result)
 
             # Gelegentlich Snapshot per MQTT anfordern
             if result and self.mqtt_broker:
