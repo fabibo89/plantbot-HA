@@ -174,7 +174,11 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         )
 
         if self.mqtt_broker:
-            hass.async_create_task(self._ensure_mqtt_subscribe())
+            # Starte MQTT-Subscribe als Hintergrund-Task (nicht abwarten!)
+            self._mqtt_subscribe_task = hass.async_create_background_task(
+                self._start_mqtt_subscribe(),
+                name=f"plantbot_mqtt_subscribe_{entry_id or 'default'}",
+            )
 
     def _merge_live_station_fields(self, target: dict, source: dict | None) -> None:
         """MQTT-Livefelder aus source in target übernehmen (source gewinnt wenn gesetzt)."""
@@ -206,10 +210,14 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         return merged
 
     async def _ensure_mqtt_subscribe(self):
+        """Stelle sicher, dass MQTT-Subscribe-Task läuft (nur wenn noch nicht gestartet)."""
         if not self.mqtt_broker or self._mqtt_subscribe_task:
             return
         _LOGGER.info("Starte MQTT-Subscribe-Task (Broker: %s:%s)", self.mqtt_broker, self.mqtt_port)
-        self._mqtt_subscribe_task = self.hass.async_create_task(self._start_mqtt_subscribe())
+        self._mqtt_subscribe_task = self.hass.async_create_background_task(
+            self._start_mqtt_subscribe(),
+            name=f"plantbot_mqtt_subscribe_{self.entry_id or 'default'}",
+        )
 
     async def _async_update_data(self):
         """Fetch data from PlantBot(s)."""
@@ -249,7 +257,8 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                     self._last_status_request = now
                     self.hass.async_create_task(self._request_status_all(result))
 
-            await self._ensure_mqtt_subscribe()
+            # MQTT-Subscribe läuft bereits als Hintergrund-Task, nicht erneut starten
+            # await self._ensure_mqtt_subscribe()
             
             return result
         except asyncio.CancelledError:
@@ -743,7 +752,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             return False
 
     async def _start_mqtt_subscribe(self):
-        """Starte MQTT-Subscribe für logs und ack."""
+        """Starte MQTT-Subscribe für logs und ack (läuft als Hintergrund-Task)."""
         if not self.mqtt_broker:
             _LOGGER.warning("Kein MQTT-Broker konfiguriert, kann nicht subscriben")
             return
@@ -759,37 +768,46 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 _LOGGER.debug("Verbinde MQTT-Client mit: %s", client_kwargs)
                 self._mqtt_subscribe_client = MQTTClient(**client_kwargs)
                 
-                async with self._mqtt_subscribe_client:
-                    _LOGGER.info("MQTT-Subscribe-Client verbunden")
-                    
-                    # Warte kurz, um sicherzustellen, dass die Verbindung vollständig etabliert ist
-                    await asyncio.sleep(0.5)
-                    
-                    # Subscribe auf alle bekannten Stationen (verwende self.data, auch wenn aktuelles Update leer war)
-                    stations_data = self.data if self.data else {}
-                    _LOGGER.info("Subscribe auf MQTT-Topics für %d Stationen", len(stations_data))
-                    await self._subscribe_to_stations(stations_data)
-                    
-                    # Warte auf Nachrichten
-                    _LOGGER.info("Warte auf MQTT-Nachrichten...")
-                    async for message in self._mqtt_subscribe_client.messages:
-                        try:
-                            _LOGGER.debug("MQTT-Nachricht empfangen: %s", message.topic.value)
-                            await self._handle_mqtt_message(message.topic.value, message.payload)
-                        except Exception as e:
-                            _LOGGER.error("Fehler beim Verarbeiten der MQTT-Nachricht: %s", e)
+                # Verbindungsaufbau mit Timeout (verhindert 5-Minuten-Blockade beim Startup)
+                try:
+                    async with asyncio.timeout(10):
+                        async with self._mqtt_subscribe_client:
+                            _LOGGER.info("MQTT-Subscribe-Client verbunden")
+                            
+                            # Warte kurz, um sicherzustellen, dass die Verbindung vollständig etabliert ist
+                            await asyncio.sleep(0.5)
+                            
+                            # Subscribe auf alle bekannten Stationen (verwende self.data, auch wenn aktuelles Update leer war)
+                            stations_data = self.data if self.data else {}
+                            _LOGGER.info("Subscribe auf MQTT-Topics für %d Stationen", len(stations_data))
+                            await self._subscribe_to_stations(stations_data)
+                            
+                            # Warte auf Nachrichten
+                            _LOGGER.info("Warte auf MQTT-Nachrichten...")
+                            async for message in self._mqtt_subscribe_client.messages:
+                                try:
+                                    _LOGGER.debug("MQTT-Nachricht empfangen: %s", message.topic.value)
+                                    await self._handle_mqtt_message(message.topic.value, message.payload)
+                                except Exception as e:
+                                    _LOGGER.error("Fehler beim Verarbeiten der MQTT-Nachricht: %s", e)
+                except asyncio.TimeoutError:
+                    _LOGGER.warning("MQTT-Verbindung zu %s:%d timeout nach 10s, versuche Reconnect in 30s", 
+                                  self.mqtt_broker, self.mqtt_port)
+                    self._mqtt_subscribe_client = None
+                    await asyncio.sleep(30)
+                    continue
                             
             except MqttError as e:
-                _LOGGER.error("MQTT-Subscribe-Fehler: %s, versuche Reconnect in 10s", e)
+                _LOGGER.error("MQTT-Subscribe-Fehler: %s, versuche Reconnect in 30s", e)
                 self._mqtt_subscribe_client = None
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
             except asyncio.CancelledError:
                 _LOGGER.info("MQTT-Subscribe abgebrochen")
                 break
             except Exception as e:
-                _LOGGER.error("Unerwarteter Fehler im MQTT-Subscribe: %s, versuche Reconnect in 10s", e)
+                _LOGGER.error("Unerwarteter Fehler im MQTT-Subscribe: %s, versuche Reconnect in 30s", e)
                 self._mqtt_subscribe_client = None
-                await asyncio.sleep(10)
+                await asyncio.sleep(30)
 
     async def _subscribe_to_stations(self, stations_data):
         """Subscribe auf MQTT-Topics für alle bekannten Stationen."""
