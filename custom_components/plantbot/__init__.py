@@ -42,11 +42,11 @@ def _async_register_station_devices(
             kwargs["configuration_url"] = f"http://{ip}"
         device = registry.async_get_or_create(**kwargs)
         _LOGGER.info(
-            "PlantBot-Gerät registriert: name=%s id=%s identifiers=%s config_entries=%s",
+            "PlantBot-Gerät registriert: name=%s id=%s identifiers=%s config_entry=%s",
             device.name,
             device.id,
             identifiers,
-            list(device.config_entries),
+            getattr(device, "config_entry_id", None),
         )
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):

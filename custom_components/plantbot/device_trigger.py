@@ -78,7 +78,10 @@ def _device_belongs_to_plantbot(hass: HomeAssistant, device_id: str) -> bool:
     if not device:
         return False
 
-    for entry_id in device.config_entries:
+    # Ab HA 2026.x gehört ein Gerät genau einem Config-Entry (config_entry_id);
+    # config_entries ist veraltet und entfällt mit HA 2027.10.
+    entry_id = getattr(device, "config_entry_id", None)
+    if entry_id:
         entry = hass.config_entries.async_get_entry(entry_id)
         if entry and entry.domain == DOMAIN:
             return True
