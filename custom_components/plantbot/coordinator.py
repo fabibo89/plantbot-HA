@@ -162,6 +162,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
         # MQTT-Client für Subscribe
         self._mqtt_subscribe_client = None
         self._mqtt_subscribe_task = None
+        self._mqtt_connected = False  # True nur solange der Subscribe-Client verbunden ist
         self._subscribed_topics = set()  # Track subscribed topics
         self._last_status_request = 0.0
         
@@ -262,8 +263,13 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                     self._last_status_request = now
                     self.hass.async_create_task(self._request_status_all(result))
 
-            # MQTT-Subscribe läuft bereits als Hintergrund-Task, nicht erneut starten
-            # await self._ensure_mqtt_subscribe()
+            # Stationen abonnieren, die beim Verbindungsaufbau noch nicht bekannt waren
+            # (z.B. weil der erste Refresh beim Start länger dauerte als der MQTT-Connect).
+            if result and self._mqtt_connected:
+                self.hass.async_create_background_task(
+                    self._subscribe_to_stations(result),
+                    name=f"plantbot_mqtt_resubscribe_{self.entry_id or 'default'}",
+                )
             
             return result
         except asyncio.CancelledError:
@@ -682,7 +688,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             return False
         topic = f"plantbot/{ip}/commands/status_request"
         try:
-            if self._mqtt_subscribe_client:
+            if self._mqtt_subscribe_client and self._mqtt_connected:
                 await self._mqtt_subscribe_client.publish(topic, b"{}", qos=1)
             else:
                 client_id = f"plantbot_req_{self.entry_id or 'default'}_{id(self)}"
@@ -780,8 +786,14 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 
                 # Verbindungsaufbau mit Timeout (verhindert 5-Minuten-Blockade beim Startup)
                 try:
-                    async with asyncio.timeout(10):
+                    async with asyncio.timeout(10) as connect_timeout:
                         async with self._mqtt_subscribe_client:
+                            # Verbunden: Das Zeitlimit gilt nur für den Verbindungsaufbau,
+                            # nicht für das anschließende Warten auf Nachrichten.
+                            connect_timeout.reschedule(None)
+                            self._mqtt_connected = True
+                            # Neue Verbindung = neue Session: alle Topics neu abonnieren
+                            self._subscribed_topics.clear()
                             _LOGGER.info(
                                 "✓ MQTT-Broker verbunden: %s:%d (Client-ID: %s)",
                                 self.mqtt_broker,
@@ -816,7 +828,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                     self._mqtt_subscribe_client = None
                     await asyncio.sleep(30)
                     continue
-                            
+                finally:
+                    self._mqtt_connected = False
+
             except MqttError as e:
                 _LOGGER.error(
                     "✗ MQTT-Subscribe-Fehler bei %s:%d - %s. Versuche Reconnect in 30s...",
@@ -847,7 +861,9 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
             return
         
         if not stations_data:
-            _LOGGER.warning("Keine Stations-Daten für Subscribe vorhanden")
+            # Normal direkt nach dem Start: Stationen kommen mit dem nächsten Refresh,
+            # _async_update_data holt das Abonnieren dann nach.
+            _LOGGER.debug("Noch keine Stations-Daten für Subscribe vorhanden")
             return
         
         _LOGGER.info("Subscribe auf MQTT-Topics für %d Stationen via Broker %s:%d", 
@@ -867,6 +883,7 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                 
                 # Topics für diese Station
                 topic_suffixes = ("logs", "ack", "update", "sensors", "status", "valves", "alerts")
+                new_for_station = 0
                 for suffix in topic_suffixes:
                     topic = f"plantbot/{ip}/{suffix}"
                     if topic not in self._subscribed_topics:
@@ -875,14 +892,18 @@ class PlantbotHACoordinator(DataUpdateCoordinator):
                             self._subscribed_topics.add(topic)
                             _LOGGER.debug("✓ Subscribed: %s", topic)
                             subscribed_count += 1
+                            new_for_station += 1
                         except Exception as e:
                             _LOGGER.warning("✗ Fehler beim Subscribe auf %s: %s", topic, e)
                     else:
                         _LOGGER.debug("Bereits subscribed: %s", topic)
 
-                # Snapshot anfordern (sensors + status + valves)
-                await self.request_status_snapshot(ip)
-            
+                # Snapshot nur für neu abonnierte Stationen anfordern (sensors + status + valves)
+                if new_for_station:
+                    await self.request_status_snapshot(ip)
+
+            if not subscribed_count:
+                return
             _LOGGER.info(
                 "✓ MQTT-Subscribe abgeschlossen: %d Topics für %d Stationen abonniert via %s:%d - Stationen: %s",
                 subscribed_count,
