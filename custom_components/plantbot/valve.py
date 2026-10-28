@@ -4,6 +4,7 @@ from .const import DOMAIN, station_device_identifiers
 from homeassistant.core import callback
 from homeassistant.components.valve import ValveDeviceClass
 from homeassistant.exceptions import HomeAssistantError
+from homeassistant.util import slugify
 import aiohttp
 import asyncio
 
@@ -74,6 +75,11 @@ class PlantbotHAValve(ValveEntity):
         self.valve_id = str(valve_data.get("id"))
         self.pump_number = valve_data.get("pump_number", 1)
         self._attr_unique_id = f"{DOMAIN}_{self.station_id}_pump_{self.pump_number}_valve_{self.valve_id}"
+        # object_id-Vorschlag nur bei NEUEN Entities (bestehende behalten ihre entity_id)
+        station_slug = slugify(self.station_name) or slugify(f"station_{self.station_id}")
+        self._attr_suggested_object_id = (
+            f"{station_slug}_p{self.pump_number}_v{self.valve_id}"
+        )
         self._attr_reports_position = False
         self._attr_supported_features = (
             ValveEntityFeature.OPEN | ValveEntityFeature.CLOSE
@@ -82,8 +88,9 @@ class PlantbotHAValve(ValveEntity):
         self._attr_device_class = ValveDeviceClass.WATER
         self.station_ip = coordinator.data.get(self.station_id, {}).get("ip")
         
-        _LOGGER.debug("Erstelle Ventil-Entität P:%d V:%s (station: %s, IP: %s)", 
-                     self.pump_number, self.valve_id, self.station_id, self.station_ip)
+        _LOGGER.debug("Erstelle Ventil-Entität P:%d V:%s (station: %s, IP: %s, suggested_id: %s)", 
+                     self.pump_number, self.valve_id, self.station_id, self.station_ip,
+                     self._attr_suggested_object_id)
 
     @property
     def available(self):
